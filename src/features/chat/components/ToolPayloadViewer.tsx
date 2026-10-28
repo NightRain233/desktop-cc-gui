@@ -90,9 +90,9 @@ export const FileDiffViewer = memo(function FileDiffViewer({
   const fileName = filePath ? filePath.split(/[\\/]/).pop() : null;
 
   return (
-    <div className="mt-1.5 overflow-hidden rounded-md border border-border-secondary bg-background-primary-default text-[12px] font-mono leading-[1.6]">
+    <div className="mt-1.5 overflow-hidden rounded-md border border-separator-border bg-background-primary-default text-[12px] font-mono leading-[1.6]">
       {/* Diff Header */}
-      <div className="flex items-center justify-between border-b border-border-secondary bg-background-secondary-default px-2.5 py-1.5 text-caption-1-medium text-text-secondary">
+      <div className="flex items-center justify-between border-b border-separator-border bg-background-secondary-default px-2.5 py-1.5 text-caption-1-medium text-text-secondary">
         <div className="flex items-center gap-1.5 overflow-hidden">
           <FileDiff className="size-3.5 shrink-0 text-text-tertiary" aria-hidden />
           <span className="truncate" title={filePath ?? undefined}>
@@ -194,6 +194,17 @@ function parseBashArgs(args: unknown): BashArgs | null {
   return null;
 }
 
+/** One-line preview of a shell call for its collapsed row (the first command
+ *  line), or null when the call is not a shell command — those keep the
+ *  generic 「参数」 toggle label. */
+export function toolCallSummary(toolName: string, args: unknown): string | null {
+  if (!isBashTool(toolName)) return null;
+  const command = parseBashArgs(args)?.command;
+  if (!command) return null;
+  const firstLine = command.split("\n").find((line) => line.trim())?.trim() ?? "";
+  return firstLine || null;
+}
+
 /** Format execution result to readable string or object format. */
 function formatExecutionResult(result: unknown): {
   text: string;
@@ -247,9 +258,9 @@ export const BashCommandViewer = memo(function BashCommandViewer({
   const formattedResult = useMemo(() => formatExecutionResult(result), [result]);
 
   return (
-    <div className="mt-1.5 overflow-hidden rounded-md border border-border-secondary bg-background-primary-default text-[12px] font-mono leading-[1.55]">
+    <div className="mt-1.5 overflow-hidden rounded-md border border-separator-border bg-background-primary-default text-[12px] font-mono leading-[1.55]">
       {/* Top Header Bar */}
-      <div className="flex items-center justify-between border-b border-border-secondary bg-background-secondary-default px-2.5 py-1.5 text-caption-1-medium text-text-secondary">
+      <div className="flex items-center justify-between border-b border-separator-border bg-background-secondary-default px-2.5 py-1.5 text-caption-1-medium text-text-secondary">
         <div className="flex items-center gap-1.5 overflow-hidden">
           <Terminal className="size-3.5 shrink-0 text-text-tertiary" aria-hidden />
           <span className="font-semibold text-text-primary">{toolName}</span>
@@ -285,7 +296,7 @@ export const BashCommandViewer = memo(function BashCommandViewer({
 
       {/* Execution Result Block */}
       {formattedResult && (
-        <div className="border-t border-border-secondary bg-background-primary-default">
+        <div className="border-t border-separator-border bg-background-primary-default">
           <div className="flex items-center justify-between px-2.5 py-1 bg-background-secondary-default/30 text-[11px] text-text-tertiary">
             <button
               type="button"
@@ -347,7 +358,7 @@ export const GenericToolViewer = memo(function GenericToolViewer({
   if (!formattedArgs && !formattedResult) return null;
 
   return (
-    <div className="mt-1.5 overflow-hidden rounded-md border border-border-secondary bg-background-secondary-default text-[11px] font-mono leading-[1.5]">
+    <div className="mt-1.5 overflow-hidden rounded-md border border-separator-border bg-background-secondary-default text-[11px] font-mono leading-[1.5]">
       {formattedArgs && (
         <div className="p-2">
           <div className="mb-1 text-caption-1-medium text-text-tertiary">
@@ -359,7 +370,7 @@ export const GenericToolViewer = memo(function GenericToolViewer({
         </div>
       )}
       {formattedResult && (
-        <div className="border-t border-border-secondary bg-background-primary-default p-2">
+        <div className="border-t border-separator-border bg-background-primary-default p-2">
           <button
             type="button"
             onClick={() => setShowResult((v) => !v)}

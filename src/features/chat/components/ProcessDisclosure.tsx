@@ -8,7 +8,7 @@ import { cx } from "@/utils/cx";
 import { StepRow, type TaskListChip } from "@/components/application/task-list/task-list";
 import { getFileTreeIconSvg } from "@/features/files/fileIcons";
 import { markToolKeys, toolEntranceKey, type ProcessItem } from "./timeline-rows";
-import { ToolPayloadViewer } from "./ToolPayloadViewer";
+import { ToolPayloadViewer, toolCallSummary } from "./ToolPayloadViewer";
 import { useLiveReveal } from "./use-live-reveal";
 import { useRevealed } from "./reveal-text";
 import { createVisibleTextReader } from "./stream-reveal";
@@ -127,6 +127,9 @@ const FrozenStepRow = memo(function FrozenStepRow({
   const { t } = useTranslation();
   const [open, setOpen] = useState(false);
   const hasPayload = args != null || result != null;
+  // Shell calls preview their command in place of the bare 「参数」 label, so a
+  // run of Bash rows says what each one ran without expanding.
+  const summary = useMemo(() => toolCallSummary(text, args), [text, args]);
   const fileChip = fileChipFor(path);
   const step = {
     label: text,
@@ -154,13 +157,18 @@ const FrozenStepRow = memo(function FrozenStepRow({
               e.stopPropagation();
               setOpen((v) => !v);
             }}
-            className="flex cursor-pointer items-center gap-0.5 text-caption-1-regular text-text-tertiary transition-colors hover:text-text-secondary"
+            title={summary ?? undefined}
+            className="flex max-w-full cursor-pointer items-center gap-0.5 text-caption-1-regular text-text-tertiary transition-colors hover:text-text-secondary"
           >
             <ChevronRight
-              className={cx("size-3 transition-transform duration-150", open && "rotate-90")}
+              className={cx("size-3 shrink-0 transition-transform duration-150", open && "rotate-90")}
               aria-hidden
             />
-            <span>{t("chat.toolCallArgs")}</span>
+            {summary ? (
+              <span className="min-w-0 truncate font-mono text-[11px]">{summary}</span>
+            ) : (
+              <span>{t("chat.toolCallArgs")}</span>
+            )}
           </button>
           {open ? (
             <ToolPayloadViewer
@@ -230,7 +238,6 @@ function expansionTransition(
   expanded: boolean,
   overridden: boolean,
   thinkingAutoCollapse: boolean,
-  hasThinking: boolean,
 ): { expanded: boolean; overridden: boolean } {
   if (next.auto && !prev.auto) {
     // Became the latest row: open it and hand control back to automation.
@@ -242,7 +249,9 @@ function expansionTransition(
     // already marked the run as finished.
     return { expanded: true, overridden };
   }
-  if (thinkingAutoCollapse && !overridden && hasThinking) {
+  // Applies to every run, tool-only included: a finished run of tool calls
+  // left open after the turn is the same noise as finished thinking.
+  if (thinkingAutoCollapse && !overridden) {
     if (!next.auto && prev.auto) {
       // A newer process run took over: this one is no longer the live tail.
       return { expanded: false, overridden };
@@ -271,12 +280,17 @@ function useProcessExpansion(
   autoExpand: boolean,
   turnLive: boolean,
   hasLiveThinking: boolean,
-  hasThinking: boolean,
   answered: boolean,
   thinkingAutoCollapse: boolean,
   searchRequest?: string,
 ) {
-  const [expanded, setExpanded] = useState(autoExpand || searchRequest !== undefined);
+  // Mounting a settled turn (history load, session switch, virtualizer
+  // remount) starts folded when auto-collapse is on: the latest run is only
+  // worth opening while it is still running and nothing answered it yet.
+  const [expanded, setExpanded] = useState(
+    searchRequest !== undefined
+      || (autoExpand && (!thinkingAutoCollapse || (turnLive && !answered))),
+  );
   // Once the user clicks the header, their choice wins over the auto
   // expand/collapse driven by streaming state.
   const [overridden, setOverridden] = useState(searchRequest !== undefined);
@@ -295,7 +309,7 @@ function useProcessExpansion(
     setPrev(next);
     const settled = searchRequest !== undefined && searchRequest !== prev.searchRequest
       ? { expanded: true, overridden: true }
-      : expansionTransition(prev, next, expanded, overridden, thinkingAutoCollapse, hasThinking);
+      : expansionTransition(prev, next, expanded, overridden, thinkingAutoCollapse);
     // Setting state to its current value bails out without a re-render, so
     // the no-op transitions are free.
     setOverridden(settled.overridden);
@@ -472,9 +486,10 @@ export const ProcessDisclosure = memo(function ProcessDisclosure({
    *  That — not a thinking-settled edge at a tool boundary — is when the run
    *  may fold. */
   answered?: boolean;
-  /** True (default): fold a thinking run once it is actually over (answer
-   *  text after it, or the turn settled). False (设置 → 通用 → 行为): keep the
-   *  run expanded; the user can still fold it by hand. */
+  /** True (default): fold a run — thinking and tool calls alike — once it is
+   *  actually over (answer text after it, or the turn settled), and mount
+   *  settled runs folded. False (设置 → 通用 → 行为): keep the run expanded;
+   *  the user can still fold it by hand. */
   thinkingAutoCollapse?: boolean;
   processId: number;
   seenTools: Set<string>;
@@ -482,12 +497,10 @@ export const ProcessDisclosure = memo(function ProcessDisclosure({
 }) {
   const { t } = useTranslation();
   const hasLiveThinking = items.some((item) => item.type === "thinking" && item.live);
-  const hasThinking = items.some((item) => item.type === "thinking");
   const { expanded, toggleExpanded } = useProcessExpansion(
     autoExpand,
     turnLive,
     hasLiveThinking,
-    hasThinking,
     answered,
     thinkingAutoCollapse,
     searchTarget?.requestKey,

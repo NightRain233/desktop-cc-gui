@@ -178,7 +178,7 @@ function PlanReviewDockBody({
           autoFocus
           placeholder={t("chat.planReviewFeedbackPlaceholder")}
           aria-label={t("chat.planReviewFeedbackLabel")}
-          className="w-full resize-y rounded-md border border-border-secondary bg-background-tertiary-default px-2.5 py-1.5 text-caption-1-regular text-text-primary outline-none placeholder:text-text-tertiary focus-visible:ring-1 focus-visible:ring-button-primary"
+          className="w-full resize-y rounded-md border border-separator-border bg-background-tertiary-default px-2.5 py-1.5 text-caption-1-regular text-text-primary outline-none placeholder:text-text-tertiary focus-visible:ring-1 focus-visible:ring-button-primary"
         />
       )}
       {notice?.kind === "conflict" && (
@@ -244,7 +244,7 @@ function PlanDockActionBar({
   const { t } = useTranslation();
   const btn =
     "inline-flex cursor-pointer items-center gap-1 rounded-md px-2.5 py-1 text-caption-1-medium transition-colors disabled:cursor-not-allowed";
-  const secondary = `${btn} border border-border-secondary bg-background-secondary-default text-text-secondary hover:bg-background-tertiary-hover`;
+  const secondary = `${btn} border border-separator-border bg-background-secondary-default text-text-secondary hover:bg-background-tertiary-hover`;
   return (
     <div className="flex flex-wrap items-center gap-2">
       <span className="text-caption-1-regular text-text-tertiary">
@@ -336,7 +336,7 @@ function PlanReviewHoldPanel({
           <button
             type="button"
             onClick={onDismiss}
-            className="inline-flex cursor-pointer items-center gap-1 rounded-md border border-border-secondary bg-background-secondary-default px-2.5 py-1 text-caption-1-medium text-text-secondary transition-colors hover:bg-background-tertiary-hover"
+            className="inline-flex cursor-pointer items-center gap-1 rounded-md border border-separator-border bg-background-secondary-default px-2.5 py-1 text-caption-1-medium text-text-secondary transition-colors hover:bg-background-tertiary-hover"
           >
             {t("chat.planReviewDismiss")}
           </button>
@@ -368,7 +368,7 @@ export function PlanReviewDock() {
   if (!message?.planReview) return null;
   return (
     <div className={centerColumnClass(wide)}>
-      <div className="rounded-xl border border-border-secondary bg-background-secondary-default px-3.5 py-3 shadow-lg">
+      <div className="rounded-xl border border-separator-border bg-background-secondary-default px-3.5 py-3 shadow-lg">
         {pending ? (
           <PlanReviewDockBody message={pending} onHold={setHold} />
         ) : (

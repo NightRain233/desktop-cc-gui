@@ -4,26 +4,24 @@
  * Every surface that shares the conversation's center track — the message
  * timeline, composer, run status, attachment chips, message queue and the
  * question / plan docks — centers itself on one track, so a wide window keeps
- * a readable line length at the cost of two blank bands. Two legacy widths
- * live on that track: the timeline's `750px` and the composer surfaces'
- * `max-w-3xl` (768px). `wideLayout` (setting 「宽幕布」, default off) drops the
- * cap and lets the track fill its pane, keeping only the 16px gutter the pane
- * already reserves. Both narrow values are kept as-is so the default look is
- * unchanged and flipping the switch only changes the cap.
+ * a readable line length at the cost of two blank bands. The timeline and the
+ * composer surfaces share one cap (`max-w-3xl`, 768px) so message edges line
+ * up with the composer card; they used to differ (750px vs 768px).
+ * `wideLayout` (setting 「宽幕布」, default off) drops the cap and lets the
+ * track fill its pane, keeping only the 16px gutter the pane already reserves.
  */
 
 const CHAT_COLUMN_WIDE = "mx-auto w-full";
-/** `MessageTimeline`'s virtual inner (the 750px message column). */
-const CHAT_COLUMN_NARROW_TIMELINE = "mx-auto w-full max-w-[750px]";
-/** The composer track: composer, status bar, chips, queue, docks. */
-const CHAT_COLUMN_NARROW_CENTER = "mx-auto w-full max-w-3xl";
+/** One cap for the timeline and the composer track (composer, status bar,
+ *  chips, queue, docks): a shared width is what keeps their edges aligned. */
+const CHAT_COLUMN_NARROW = "mx-auto w-full max-w-3xl";
 
 /** Class for the timeline's column; `wide` = setting on. */
 export function timelineColumnClass(wide: boolean): string {
-  return wide ? CHAT_COLUMN_WIDE : CHAT_COLUMN_NARROW_TIMELINE;
+  return wide ? CHAT_COLUMN_WIDE : CHAT_COLUMN_NARROW;
 }
 
 /** Class for a composer-track surface; `wide` = setting on. */
 export function centerColumnClass(wide: boolean): string {
-  return wide ? CHAT_COLUMN_WIDE : CHAT_COLUMN_NARROW_CENTER;
+  return wide ? CHAT_COLUMN_WIDE : CHAT_COLUMN_NARROW;
 }

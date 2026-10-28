@@ -392,3 +392,59 @@ describe("输入框占位提示的前提改口", () => {
     expect(box?.getAttribute("data-placeholder")).toBe(i18n.t("chat.inputPlaceholder"));
   });
 });
+
+describe("输入框工具栏分组", () => {
+  let container: HTMLDivElement;
+  let root: Root;
+
+  beforeEach(() => {
+    container = document.createElement("div");
+    document.body.appendChild(container);
+    root = createRoot(container);
+    vi.spyOn(ipc, "getAppSettings").mockResolvedValue({} as AppSettings);
+  });
+
+  afterEach(async () => {
+    await act(async () => {
+      root.unmount();
+    });
+    container.remove();
+    vi.restoreAllMocks();
+  });
+
+  it("toolbarTrailing 渲染在发送键之前、同一行", async () => {
+    await act(async () => {
+      root.render(
+        <HashRouter>
+          <Composer value="hi" toolbarTrailing={<span data-testid="trailing">ctx</span>} />
+        </HashRouter>,
+      );
+    });
+    const trailing = container.querySelector('[data-testid="trailing"]')!;
+    const send = container.querySelector(`button[aria-label="${i18n.t("chat.send")}"]`)!;
+    expect(trailing.parentElement).toBe(send.parentElement);
+    expect(trailing.compareDocumentPosition(send) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+
+  it("StatusBar 在 hideContextControls 时不渲染上下文圆环；左侧也为空则整行不渲染", async () => {
+    await act(async () => {
+      root.render(
+        <HashRouter>
+          <StatusBar usagePct={12} hideContextControls />
+        </HashRouter>,
+      );
+    });
+    expect(container.querySelector(`button[aria-label="${i18n.t("chat.contextWindow")}"]`)).toBeNull();
+    expect(container.childElementCount).toBe(0);
+
+    await act(async () => {
+      root.render(
+        <HashRouter>
+          <StatusBar usagePct={12} />
+        </HashRouter>,
+      );
+    });
+    expect(container.querySelector(`button[aria-label="${i18n.t("chat.contextWindow")}"]`)).not.toBeNull();
+    expect(container.textContent).toContain("12%");
+  });
+});

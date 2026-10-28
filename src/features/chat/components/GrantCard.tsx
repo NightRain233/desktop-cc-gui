@@ -35,8 +35,28 @@ export function GrantCard({ message }: { message: Message }) {
     if (key) void respondToGrant(key, message.seq, accept);
   };
 
+  // A declined request is settled history, not a call to action: one muted
+  // line instead of a card, so it stops outweighing the conversation.
+  if (grant.status === "declined") {
+    return (
+      <div
+        data-grant-status="declined"
+        className="flex max-w-[85%] items-center gap-1.5 text-left text-caption-1-regular text-text-tertiary"
+      >
+        <FolderLock className="size-3.5 shrink-0 text-foreground-icon-tertiary" aria-hidden />
+        <span className="text-caption-1-medium text-text-secondary">
+          {t(path ? "chat.grantTitle" : "chat.grantTitleAction")}
+        </span>
+        <span aria-hidden>·</span>
+        <span className="min-w-0 truncate" title={path || undefined}>
+          {t("chat.grantDeclined")}
+        </span>
+      </div>
+    );
+  }
+
   return (
-    <div className="flex max-w-[85%] flex-col gap-2 rounded-xl border border-border-secondary bg-background-secondary-default px-3.5 py-2.5 text-left">
+    <div data-grant-status={grant.status} className="flex max-w-[85%] flex-col gap-2 rounded-xl border border-separator-border bg-background-secondary-default px-3.5 py-2.5 text-left">
       <div className="flex items-center gap-1.5 text-caption-1-medium text-text-primary">
         <FolderLock className="size-3.5 shrink-0 text-foreground-icon-secondary" aria-hidden />
         {t(path ? "chat.grantTitle" : "chat.grantTitleAction")}
@@ -61,11 +81,6 @@ export function GrantCard({ message }: { message: Message }) {
           streaming={streaming}
           onResend={() => key && void resendLastUser(key)}
         />
-      )}
-      {grant.status === "declined" && (
-        <div className="text-caption-1-regular text-text-tertiary">
-          {t("chat.grantDeclined")}
-        </div>
       )}
     </div>
   );

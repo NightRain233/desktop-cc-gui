@@ -237,7 +237,7 @@ export function ShortcutsSection() {
                       className={cx(
                         "flex h-8 min-w-20 items-center justify-center rounded-lg border px-2 outline-none transition-colors",
                         recording
-                          ? "border-border-brand-solid bg-background-primary-default text-text-secondary"
+                          ? "border-border-focus-ring bg-background-primary-default text-text-secondary"
                           : "border-border-button-default bg-background-primary-default hover:bg-background-secondary-hover",
                       )}
                     >

@@ -1,9 +1,7 @@
 import { Fragment, useCallback, useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { getAppVersion, isWeb } from "@/lib/platform";
+import { isWeb } from "@/lib/platform";
 import Activity from "lucide-react/dist/esm/icons/activity";
-import Minus from "lucide-react/dist/esm/icons/minus";
-import Plus from "lucide-react/dist/esm/icons/plus";
 import RefreshCw from "lucide-react/dist/esm/icons/refresh-cw";
 import { ActionFeedbackIcon, useRunningFeedback } from "@/components/base/action-feedback";
 import { ipc, type AppMetrics } from "@/lib/ipc";
@@ -12,12 +10,10 @@ import { useTauriEvent } from "@/hooks/use-tauri-event";
 import { cx } from "@/utils/cx";
 import { compareByOrder, pluginIdFromRegistryKey, statusBarRegistry, useRegistry } from "@ccgui/plugin-sdk";
 import { PluginBoundary } from "@/features/plugins/boundary/PluginBoundary";
-import { dismissCenterSurfaces } from "@/features/chat/center-surfaces";
-import { useReleaseNotesTabStore } from "@/features/update/notes-tab";
 import { registerShortcutHandler } from "@/features/shortcuts/runtime";
 import { PerformanceDiagnosticsDialog } from "@/features/settings/PerformanceDiagnostics";
 
-import { applyZoom, changeZoom, onZoomChange, readZoomPct, ZOOM_STEP } from "@/lib/zoom";
+import { applyZoom, changeZoom, readZoomPct, ZOOM_STEP } from "@/lib/zoom";
 
 const METRICS_POLL_MS = 3000;
 
@@ -26,21 +22,22 @@ function formatMb(bytes: number): number {
 }
 
 /**
- * App-wide bottom chrome: performance, zoom, history-sync status, version.
+ * App-wide bottom chrome: performance (label reveals on hover/focus) and
+ * history-sync status. Zoom is shortcut-only (⌘= / ⌘- / ⌘0, Settings →
+ * 通用 → 外观) and the version lives in Settings → 更新, so neither takes
+ * permanent space here.
  *
  * The builtin items stay hand-wired here and are intentionally NOT migrated
  * into statusBarRegistry: they are deeply coupled to ipc/listen hooks, so
  * registration would buy little. The registry is the plugin extension point
  * (plan §4.2 #8): entries registered via ctx.ui.registerStatusBarItem render
- * after the sync status, before the version, each inside a PluginBoundary.
+ * after the sync status, each inside a PluginBoundary.
  * zone:"start" entries (SDK 0.3.8) render left-aligned ahead of the cluster.
  */
 export function AppStatusBar() {
   const { t } = useTranslation();
   const [metrics, setMetrics] = useState<AppMetrics | null>(null);
-  const [zoomPct, setZoomPct] = useState(readZoomPct);
   const [sync, setSync] = useState<ScanProgress | null>(null);
-  const [version, setVersion] = useState<string | null>(null);
   const [showDiagnostics, setShowDiagnostics] = useState(false);
   const pluginItems = useRegistry(statusBarRegistry);
   // zone (SDK 0.3.8): "start" chips render left-aligned ahead of the
@@ -51,9 +48,6 @@ export function AppStatusBar() {
   // Re-apply the persisted zoom on startup; Tauri does not restore it.
   useEffect(() => applyZoom(readZoomPct()), []);
 
-  // Follow zoom changes from every entry point (shortcuts below, Settings →
-  // 通用 → 外观 → 界面缩放) so the percent label never goes stale.
-  useEffect(() => onZoomChange(setZoomPct), []);
   // Zoom keys live in the shortcut runtime (defaults ⌘= / ⌘- / ⌘0,
   // configurable in Settings → Shortcuts). Web mode skips registration:
   // browsers own ⌘± natively. readZoomPct() keeps handlers stale-free.
@@ -67,12 +61,6 @@ export function AppStatusBar() {
       unOut();
       unReset();
     };
-  }, []);
-
-  useEffect(() => {
-    void getAppVersion().then((v) => {
-      if (v) setVersion(v);
-    });
   }, []);
 
   useEffect(() => {
@@ -137,7 +125,7 @@ export function AppStatusBar() {
           type="button"
           onClick={() => setShowDiagnostics(true)}
           aria-label={t("diagnostics.open")}
-          className="flex cursor-pointer items-center gap-1 rounded transition-colors hover:bg-background-tertiary-hover focus-visible:outline focus-visible:outline-2 focus-visible:outline-border-focus-ring"
+          className="group flex cursor-pointer items-center gap-1 rounded px-1 transition-colors hover:bg-background-tertiary-hover focus-visible:outline focus-visible:outline-2 focus-visible:outline-border-focus-ring"
           title={
             metrics
               ? t("statusbar.perfDetail", {
@@ -148,48 +136,12 @@ export function AppStatusBar() {
           }
         >
           <Activity className="size-3.5 shrink-0 text-foreground-icon-tertiary" aria-hidden />
-          <span className="whitespace-nowrap">
+          {/* Collapsed to the icon until hovered / focused. */}
+          <span className="hidden whitespace-nowrap group-hover:inline group-focus-visible:inline">
             {t("statusbar.performance")}
             {metrics ? ` ${formatMb(metrics.memoryBytes)} MB` : ""}
           </span>
         </button>
-
-        <span className="text-text-disabled">·</span>
-
-        {/* Zoom drives the native webview; browsers zoom natively. */}
-        {!isWeb && (
-        <span className="flex items-center gap-1">
-          <button
-            type="button"
-            aria-label={t("statusbar.zoomOut")}
-            title={t("statusbar.zoomOut")}
-            className={iconButton}
-            onClick={() => changeZoom(zoomPct - ZOOM_STEP)}
-          >
-            <Minus className="size-3.5" aria-hidden />
-          </button>
-          <button
-            type="button"
-            aria-label={t("statusbar.resetZoom")}
-            title={t("statusbar.resetZoom")}
-            className="min-w-9 cursor-pointer rounded text-center transition-colors hover:text-text-secondary"
-            onClick={() => changeZoom(100)}
-          >
-            {zoomPct}%
-          </button>
-          <button
-            type="button"
-            aria-label={t("statusbar.zoomIn")}
-            title={t("statusbar.zoomIn")}
-            className={iconButton}
-            onClick={() => changeZoom(zoomPct + ZOOM_STEP)}
-          >
-            <Plus className="size-3.5" aria-hidden />
-          </button>
-        </span>
-        )}
-
-        <span className="text-text-disabled">·</span>
 
         <button
           type="button"
@@ -207,23 +159,13 @@ export function AppStatusBar() {
           />
         </button>
 
-        {sync && (
-          <>
-            <span className="text-text-disabled">·</span>
-            <span
-              className={cx(
-                "whitespace-nowrap",
-                sync.finished ? "text-text-tertiary" : "text-notification-success-foreground",
-              )}
-            >
-              {sync.finished
-                ? t("statusbar.synced")
-                : t("statusbar.syncing", { pct: syncPct, done: sync.done, total: sync.total })}
-            </span>
-          </>
+        {syncing && sync && (
+          <span className="whitespace-nowrap text-notification-success-foreground">
+            {t("statusbar.syncing", { pct: syncPct, done: sync.done, total: sync.total })}
+          </span>
         )}
         {/* Plugin status-bar chips (plan §4.2 #8), placed right-aligned after
-         *  the sync status and before the version. Each chip renders in its
+         *  the sync status. Each chip renders in its
          *  own PluginBoundary so a render crash unmounts only that chip; the
          *  plugin owns the chip's look — the host provides placement and the
          *  row gap only. */}
@@ -236,34 +178,11 @@ export function AppStatusBar() {
             const pluginId = pluginIdFromRegistryKey(def.id);
             const Chip = def.component;
             return (
-              <Fragment key={def.id}>
-                <span className="text-text-disabled">·</span>
-                <PluginBoundary pluginId={pluginId}>
-                  <Chip />
-                </PluginBoundary>
-              </Fragment>
+              <PluginBoundary key={def.id} pluginId={pluginId}>
+                <Chip />
+              </PluginBoundary>
             );
           })}
-        {version && (
-          <>
-            <span className="text-text-disabled">·</span>
-            <button
-              type="button"
-              aria-label={t("changelog.title")}
-              title={t("commands.openReleaseNotes")}
-              className="shrink-0 cursor-pointer rounded px-1 transition-colors hover:bg-background-tertiary-hover hover:text-text-secondary"
-              // 版本号打开版本更新页签：先清掉其他中心面（同插件入口），再打开/
-              // 聚焦更新说明页签（版本历史翻页入口已随弹窗下线，见
-              // ReleaseNotesPane）。
-              onClick={() => {
-                dismissCenterSurfaces();
-                useReleaseNotesTabStore.getState().openTab();
-              }}
-            >
-              v{version}
-            </button>
-          </>
-        )}
         {showDiagnostics && <PerformanceDiagnosticsDialog onClose={() => setShowDiagnostics(false)} />}
       </div>
     </div>

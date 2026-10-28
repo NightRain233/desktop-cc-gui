@@ -43,7 +43,7 @@ export function PlanStatusBadge({ status }: { status: PlanReviewStatus }) {
       ? "border-button-primary/40 text-text-primary"
       : status === "approved"
         ? "border-button-primary/40 text-text-primary"
-        : "border-border-secondary text-text-tertiary";
+        : "border-separator-border text-text-tertiary";
   return (
     <span
       className={`shrink-0 rounded-md border px-1.5 py-0.5 text-caption-1-regular ${tone}`}
@@ -61,7 +61,7 @@ export function CopyPlanButton({ content }: { content: string }) {
     <button
       type="button"
       onClick={() => copy(content)}
-      className="inline-flex cursor-pointer items-center gap-1 rounded-md border border-border-secondary bg-background-secondary-default px-2.5 py-1 text-caption-1-medium text-text-secondary transition-colors hover:bg-background-tertiary-hover"
+      className="inline-flex cursor-pointer items-center gap-1 rounded-md border border-separator-border bg-background-secondary-default px-2.5 py-1 text-caption-1-medium text-text-secondary transition-colors hover:bg-background-tertiary-hover"
     >
       {copied ? (
         <Check className="size-3.5" aria-hidden />
@@ -160,8 +160,8 @@ export function PlanPreviewOverlay({
         className="absolute inset-0 block size-full cursor-default bg-black/40"
       />
       <div className="pointer-events-none relative flex h-full w-full justify-end">
-        <div className="pointer-events-auto flex h-full w-full flex-col bg-background-primary-default sm:max-w-[720px] sm:border-l sm:border-border-primary">
-          <div className="flex shrink-0 flex-wrap items-center gap-x-2 gap-y-1 border-b border-border-primary px-4 py-3">
+        <div className="pointer-events-auto flex h-full w-full flex-col bg-background-primary-default sm:max-w-[720px] sm:border-l sm:border-separator-border">
+          <div className="flex shrink-0 flex-wrap items-center gap-x-2 gap-y-1 border-b border-separator-border px-4 py-3">
             <PlanCardHeader record={record} />
             <div className="ml-auto flex items-center gap-2">
               <CopyPlanButton content={record.content} />
@@ -199,7 +199,7 @@ export function PlanViewFullButton({
       <button
         type="button"
         onClick={() => setOpen(true)}
-        className="inline-flex cursor-pointer items-center gap-1 rounded-md border border-border-secondary bg-background-secondary-default px-2.5 py-1 text-caption-1-medium text-text-secondary transition-colors hover:bg-background-tertiary-hover"
+        className="inline-flex cursor-pointer items-center gap-1 rounded-md border border-separator-border bg-background-secondary-default px-2.5 py-1 text-caption-1-medium text-text-secondary transition-colors hover:bg-background-tertiary-hover"
       >
         {t("chat.planReviewViewFull")}
       </button>
@@ -231,7 +231,7 @@ export function PlanReviewCard({
   const key = useScopedSessionKey() || null;
   if (!record) return null;
   return (
-    <div className="flex max-w-[85%] flex-col gap-1.5 rounded-xl border border-border-secondary bg-background-secondary-default px-3.5 py-2.5 text-left">
+    <div className="flex max-w-[85%] flex-col gap-1.5 rounded-xl border border-separator-border bg-background-secondary-default px-3.5 py-2.5 text-left">
       <PlanCardHeader record={record} />
       {record.content.trim() && (
         <div className="text-caption-1-regular text-text-secondary [overflow-wrap:anywhere]">
@@ -247,7 +247,7 @@ export function PlanReviewCard({
         {record.status === "deferred" && record.complete && key && (
           <button
             type="button"
-            className="inline-flex cursor-pointer items-center gap-1 rounded-md border border-border-secondary bg-background-secondary-default px-2.5 py-1 text-caption-1-medium text-text-secondary transition-colors hover:bg-background-tertiary-hover"
+            className="inline-flex cursor-pointer items-center gap-1 rounded-md border border-separator-border bg-background-secondary-default px-2.5 py-1 text-caption-1-medium text-text-secondary transition-colors hover:bg-background-tertiary-hover"
             onClick={() =>
               resumePlanReview(key, `${record.planId}:${record.revision}`)
             }

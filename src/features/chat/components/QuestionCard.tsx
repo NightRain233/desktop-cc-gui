@@ -154,7 +154,7 @@ function OptionGlyph({ selected, multi }: { selected: boolean; multi: boolean })
           ? multi
             ? "border-button-primary bg-button-primary text-text-white"
             : "border-button-primary bg-background-primary-default"
-          : "border-border-secondary"
+          : "border-separator-border"
       }`}
     >
       {selected &&
@@ -309,7 +309,7 @@ function QuestionOptions({
           }}
           placeholder={t("chat.questionOtherPlaceholder")}
           aria-label={t("chat.questionOther")}
-          className="rounded-md border border-border-secondary bg-background-tertiary-default px-2.5 py-1.5 text-caption-1-regular text-text-primary outline-none placeholder:text-text-tertiary focus-visible:ring-1 focus-visible:ring-button-primary"
+          className="rounded-md border border-separator-border bg-background-tertiary-default px-2.5 py-1.5 text-caption-1-regular text-text-primary outline-none placeholder:text-text-tertiary focus-visible:ring-1 focus-visible:ring-button-primary"
         />
       )}
     </div>
@@ -386,7 +386,7 @@ export function QuestionCard({ message }: { message: Message }) {
           <button
             type="button"
             onClick={skip}
-            className={`${btn} border border-border-secondary bg-background-secondary-default text-text-secondary hover:bg-background-tertiary-hover`}
+            className={`${btn} border border-separator-border bg-background-secondary-default text-text-secondary hover:bg-background-tertiary-hover`}
           >
             {t("chat.questionSkip")}
           </button>
@@ -394,7 +394,7 @@ export function QuestionCard({ message }: { message: Message }) {
             <button
               type="button"
               onClick={walkToNext}
-              className={`${btn} border border-border-secondary bg-background-secondary-default text-text-secondary hover:bg-background-tertiary-hover`}
+              className={`${btn} border border-separator-border bg-background-secondary-default text-text-secondary hover:bg-background-tertiary-hover`}
             >
               {t("chat.questionConfirmAndContinue")}
             </button>
@@ -426,7 +426,7 @@ export function QuestionRecord({ message }: { message: Message }) {
   if (!question) return null;
   const { status, questions } = question;
   return (
-    <div className="flex max-w-[85%] flex-col gap-1 rounded-xl border border-border-secondary bg-background-secondary-default px-3.5 py-2.5 text-left">
+    <div className="flex max-w-[85%] flex-col gap-1 rounded-xl border border-separator-border bg-background-secondary-default px-3.5 py-2.5 text-left">
       <div className="flex items-center gap-1.5 text-caption-1-medium text-text-secondary">
         <Check className="size-3.5 shrink-0 text-foreground-icon-secondary" aria-hidden />
         {t("chat.questionTitle")}

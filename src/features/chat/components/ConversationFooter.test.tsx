@@ -42,6 +42,7 @@ vi.mock("@/lib/events", () => ({
 const statusBarProps = vi.hoisted(() => ({ current: null as Record<string, unknown> | null }));
 vi.mock("@/components/application/ai-chat/ai-chat-composer", () => ({
   Composer: () => null,
+  ComposerContextControls: () => null,
   StatusBar: (props: Record<string, unknown>) => {
     statusBarProps.current = props;
     return null;
@@ -231,5 +232,14 @@ describe("ConversationFooter 状态栏文件夹显示", () => {
       (props.onFolderSelect as (index: number) => void)(1);
     });
     expect(startNewChat).toHaveBeenCalledWith("/tmp/two/app");
+  });
+
+  it("输入框在场时上下文控件挪进输入框，下方状态行不再重复渲染", async () => {
+    await act(async () => {
+      root.render(<ConversationFooter {...footerProps()} />);
+    });
+    // 同一份 props 喂给工具栏与状态行；状态行只在 dock 顶替输入框时兜底显示。
+    expect(statusBarProps.current!.hideContextControls).toBe(true);
+    expect(statusBarProps.current!.usagePct).toBeDefined();
   });
 });

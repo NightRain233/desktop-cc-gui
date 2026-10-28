@@ -169,14 +169,14 @@ function Fixture() {
           <DockProbe />
         </Section>
         <Section title="长 Markdown 预览(中文 / emoji / 表格 / 代码块 / 超长文)">
-          <div className="max-h-[480px] overflow-y-auto rounded-xl border border-border-secondary px-4 py-3">
+          <div className="max-h-[480px] overflow-y-auto rounded-xl border border-separator-border px-4 py-3">
             <Markdown text={FULL_CONTENT} workspacePath="/tmp/fixture" />
           </div>
           <div>
             <button
               type="button"
               onClick={() => setOverlayOpen(true)}
-              className="cursor-pointer rounded-md border border-border-secondary bg-background-secondary-default px-2.5 py-1 text-caption-1-medium text-text-secondary hover:bg-background-tertiary-hover"
+              className="cursor-pointer rounded-md border border-separator-border bg-background-secondary-default px-2.5 py-1 text-caption-1-medium text-text-secondary hover:bg-background-tertiary-hover"
             >
               打开完整预览(侧面板)
             </button>

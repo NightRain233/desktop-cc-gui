@@ -124,6 +124,9 @@ export interface ComposerProps {
    *  a missing prerequisite, so the field stops advertising an Enter that is
    *  swallowed in that state. */
   placeholder?: string;
+  /** Right-aligned toolbar controls rendered just before send (context meter,
+   *  proxy switch): per-turn state sits next to the action it informs. */
+  toolbarTrailing?: ReactNode;
 }
 
 export function Composer({
@@ -144,6 +147,7 @@ export function Composer({
   onPastePaths,
   workspacePath,
   placeholder,
+  toolbarTrailing,
 }: ComposerProps = {}) {
   const editableRef = useRef<HTMLDivElement>(null);
   // Track active IME composition synchronously; ComposerEditable also checks
@@ -345,6 +349,7 @@ export function Composer({
           addMenu={addMenu}
           cliMenu={cliMenu}
           permissionMenu={permissionMenu}
+          trailing={toolbarTrailing}
           streaming={streaming}
           disabled={disabled}
           disabledReason={disabledReason}
@@ -470,34 +475,10 @@ function ContextRing({ pct }: { pct: number }) {
   );
 }
 
-export function StatusBar({
-  branch,
-  branches,
-  branchRepoName,
-  onBranchSelect,
-  folders,
-  selectedFolder,
-  onFolderSelect,
-  usagePct,
-  contextMax,
-  contextSegments,
-  onCompactContext,
-  onRefreshUsage,
-  compacting,
-  refreshing,
-  canCompact,
-  autoCompact,
-  autoCompactDisabled,
-  onAutoCompactEnabledChange,
-  onAutoCompactThresholdChange,
-}: {
-  branch?: string;
-  branches?: BranchMenuItem[];
-  branchRepoName?: string;
-  onBranchSelect?: (name: string) => void;
-  folders?: string[];
-  selectedFolder?: string;
-  onFolderSelect?: (index: number) => void;
+/** Context-window meter + its breakdown popover, and the proxy switch. Lives
+ *  in the composer toolbar next to send; StatusBar keeps a copy for when the
+ *  composer is replaced by a question / plan dock. */
+export interface ContextControlsProps {
   usagePct?: number;
   contextMax?: number;
   contextSegments?: ContextSegment[];
@@ -511,7 +492,22 @@ export function StatusBar({
   autoCompactDisabled?: boolean;
   onAutoCompactEnabledChange?: (enabled: boolean) => void;
   onAutoCompactThresholdChange?: (threshold: number) => void;
-}) {
+}
+
+export function ComposerContextControls({
+  usagePct,
+  contextMax,
+  contextSegments,
+  onCompactContext,
+  onRefreshUsage,
+  compacting,
+  refreshing,
+  canCompact,
+  autoCompact,
+  autoCompactDisabled,
+  onAutoCompactEnabledChange,
+  onAutoCompactThresholdChange,
+}: ContextControlsProps) {
   const { t } = useTranslation();
   // `isNonModal` popovers don't dismiss on outside press (react-aria couples
   // the two); restore it manually — same fix as Select (see the hook doc).
@@ -523,9 +519,6 @@ export function StatusBar({
     contextPopoverRef,
   ]);
   const allowContextOpenChange = useTriggerToggle(contextOpen, contextTriggerRef);
-  // Plugin chips (SDK 0.3.9, permission ui:composer-status) render in the
-  // left group after the branch switcher, each behind its own boundary.
-  const pluginItems = useRegistry(composerStatusRegistry);
   const limitsContext = useMemo(
     () => ({ max: contextMax ?? ASSUMED_CONTEXT_WINDOW, segments: contextSegments ?? [] }),
     [contextMax, contextSegments],
@@ -550,9 +543,94 @@ export function StatusBar({
     [t],
   );
   return (
-    <div className="flex h-[26px] w-full items-center justify-between select-none">
+    <div className="flex shrink-0 items-center gap-1">
+      <ProxyQuickToggle />
+      {/* Context meter is always on: 0% until the first usage report. */}
+      <AriaDialogTrigger
+        isOpen={contextOpen}
+        onOpenChange={(o) => allowContextOpenChange(o) && setContextOpen(o)}
+      >
+        <AriaButton
+          ref={contextTriggerRef}
+          aria-label={t("chat.contextWindow")}
+          className="flex cursor-pointer items-center gap-1 rounded-[40px] py-1 pr-2 pl-1.5 outline-none transition-colors duration-150 ease hover:bg-background-tertiary-hover focus-visible:ring-2 focus-visible:ring-border-focus-ring"
+        >
+          <ContextRing pct={usagePct ?? 0} />
+          <span className="text-caption-1-medium whitespace-nowrap text-text-tertiary">
+            {usagePct ?? 0}%
+          </span>
+        </AriaButton>
+        <AriaPopover
+          ref={contextPopoverRef}
+          isNonModal
+          placement="top end"
+          offset={8}
+          className={CONTEXT_POPOVER_CLASSES}
+        >
+          <AriaDialog aria-label={t("chat.contextWindow")} className="outline-none">
+            <AgentLimitsCard
+              context={limitsContext}
+              plan={EMPTY_PLAN}
+              limits={EMPTY_LIMITS}
+              text={limitsText}
+              onCompact={onCompactContext}
+              onRefresh={onRefreshUsage}
+              compacting={compacting}
+              refreshing={refreshing}
+              canCompact={canCompact}
+              autoCompact={
+                autoCompact
+                  ? {
+                      ...autoCompact,
+                      disabled: autoCompactDisabled === true,
+                      onEnabledChange: onAutoCompactEnabledChange ?? (() => {}),
+                      onThresholdChange: onAutoCompactThresholdChange ?? (() => {}),
+                    }
+                  : undefined
+              }
+            />
+          </AriaDialog>
+        </AriaPopover>
+      </AriaDialogTrigger>
+    </div>
+  );
+}
+
+export interface StatusBarProps extends ContextControlsProps {
+  branch?: string;
+  branches?: BranchMenuItem[];
+  branchRepoName?: string;
+  onBranchSelect?: (name: string) => void;
+  folders?: string[];
+  selectedFolder?: string;
+  onFolderSelect?: (index: number) => void;
+  /** The composer toolbar already shows the context controls: omit them
+   *  here so they never appear twice. */
+  hideContextControls?: boolean;
+}
+
+/** Row under the composer: workspace folder, branch and plugin chips (left);
+ *  the context controls only when the composer is not on screen. */
+export function StatusBar({
+  branch,
+  branches,
+  branchRepoName,
+  onBranchSelect,
+  folders,
+  selectedFolder,
+  onFolderSelect,
+  hideContextControls = false,
+  ...contextProps
+}: StatusBarProps) {
+  // Plugin chips (SDK 0.3.9, permission ui:composer-status) render in the
+  // left group after the branch switcher, each behind its own boundary.
+  const pluginItems = useRegistry(composerStatusRegistry);
+  const hasFolders = !!folders && folders.length > 0;
+  if (!hasFolders && !branch && pluginItems.length === 0 && hideContextControls) return null;
+  return (
+    <div className="flex h-[26px] w-full items-center justify-between px-2 select-none">
       <div className="flex min-w-0 items-center gap-3">
-        {folders && folders.length > 0 && (
+        {hasFolders && (
           <ProjectFolderMenu
             folders={folders}
             selectedName={selectedFolder}
@@ -588,56 +666,7 @@ export function StatusBar({
           );
         })}
       </div>
-      <div className="flex shrink-0 items-center gap-3">
-        <ProxyQuickToggle />
-        {/* Context meter is always on: 0% until the first usage report. */}
-        <AriaDialogTrigger
-          isOpen={contextOpen}
-          onOpenChange={(o) => allowContextOpenChange(o) && setContextOpen(o)}
-        >
-          <AriaButton
-            ref={contextTriggerRef}
-            aria-label={t("chat.contextWindow")}
-            className="flex cursor-pointer items-center gap-1 rounded-[40px] py-1 pr-2 pl-1.5 outline-none transition-colors duration-150 ease focus-visible:ring-2 focus-visible:ring-border-focus-ring"
-          >
-            <ContextRing pct={usagePct ?? 0} />
-            <span className="text-body-2-medium whitespace-nowrap text-text-secondary">
-              {usagePct ?? 0}%
-            </span>
-          </AriaButton>
-          <AriaPopover
-            ref={contextPopoverRef}
-            isNonModal
-            placement="top end"
-            offset={8}
-            className={CONTEXT_POPOVER_CLASSES}
-          >
-            <AriaDialog aria-label={t("chat.contextWindow")} className="outline-none">
-              <AgentLimitsCard
-                context={limitsContext}
-                plan={EMPTY_PLAN}
-                limits={EMPTY_LIMITS}
-                text={limitsText}
-                onCompact={onCompactContext}
-                onRefresh={onRefreshUsage}
-                compacting={compacting}
-                refreshing={refreshing}
-                canCompact={canCompact}
-                autoCompact={
-                  autoCompact
-                    ? {
-                        ...autoCompact,
-                        disabled: autoCompactDisabled === true,
-                        onEnabledChange: onAutoCompactEnabledChange ?? (() => {}),
-                        onThresholdChange: onAutoCompactThresholdChange ?? (() => {}),
-                      }
-                    : undefined
-                }
-              />
-            </AriaDialog>
-          </AriaPopover>
-        </AriaDialogTrigger>
-      </div>
+      {!hideContextControls && <ComposerContextControls {...contextProps} />}
     </div>
   );
 }

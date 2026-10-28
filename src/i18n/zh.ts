@@ -687,7 +687,7 @@ export const zh = {
     restartNow: "立即重启",
     sidebarThreadLimit: "每个工作区显示的会话数",
     uiZoom: "界面缩放",
-    uiZoomDesc: "与状态栏 ± 按钮和缩放快捷键同步",
+    uiZoomDesc: "与缩放快捷键同步",
     contentFontSize: "内容字体大小",
     contentFontSizeDesc: "调整聊天正文的基础字号",
     codeFontSize: "代码字体大小",
@@ -783,9 +783,9 @@ export const zh = {
     sendShortcutEnter: "Enter",
     sendShortcutCmdEnter: "Cmd+Enter",
     sendShortcutCmdEnterCtrl: "Ctrl+Enter",
-    thinkingAutoCollapse: "思考结束后自动收起",
+    thinkingAutoCollapse: "完成后自动折叠思考与工具调用",
     thinkingAutoCollapseDesc:
-      "关闭后，思考过程在本轮回复中保持展开，可点击标题手动收起",
+      "回答开始或本轮结束后折叠思考与工具调用，打开历史会话时也保持折叠；关闭后保持展开，可点击标题手动收起",
     fileTreeHideIgnored: "文件树隐藏 Git 忽略的文件",
     fileTreeHideIgnoredDesc:
       "隐藏被 .gitignore 忽略的文件和文件夹（含 .git）；关闭时以浅色显示",
@@ -813,6 +813,7 @@ export const zh = {
     communityQrAlt: "官方微信交流群二维码",
     socialTitle: "关注我们",
     socialDocs: "官方文档",
+    releaseNotesOpen: "查看",
     checkUpdates: "检查更新",
     updateChecking: "正在检查更新…",
     updateLatest: "已是最新版本",

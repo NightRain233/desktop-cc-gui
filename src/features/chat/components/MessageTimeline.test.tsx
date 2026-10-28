@@ -595,20 +595,20 @@ describe("chat column width (宽幕布)", () => {
     return container.querySelector<HTMLElement>("[data-virtual-inner]")!;
   }
 
-  it("keeps the centered 750px column by default", async () => {
+  it("keeps the centered 768px column by default", async () => {
     const inner = await render(false);
     expect(inner.className).toContain("mx-auto");
-    expect(inner.className).toContain("max-w-[750px]");
+    expect(inner.className).toContain("max-w-3xl");
   });
 
   it("drops the cap while 宽幕布 is on, and restores it when switched off", async () => {
     const inner = await render(true);
     expect(inner.className).toContain("w-full");
-    expect(inner.className).not.toContain("max-w-[750px]");
+    expect(inner.className).not.toContain("max-w-3xl");
 
     // Live toggle: the mounted timeline follows the store slice.
     await act(async () => useChatStore.setState({ wideLayout: false }));
-    expect(inner.className).toContain("max-w-[750px]");
+    expect(inner.className).toContain("max-w-3xl");
   });
 });
 
