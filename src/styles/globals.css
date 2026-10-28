@@ -1,5 +1,6 @@
 @import "tailwindcss";
 @import "./theme.css";
+@import "./legacy-colors.css";
 @import "./typography.css";
 /* Streamdown markdown renderer (file preview): let Tailwind see the utility
  * classes inside the installed packages. Paths resolve from this file to the
