@@ -66,7 +66,7 @@ function ConversationModeSession({ mode, ...props }: PluginConversationProps & {
   const Component = mode.component;
   return (
     <div className="flex min-h-0 flex-1 flex-col" data-conversation-mode={mode.id}>
-      <div className="flex shrink-0 items-center border-b border-border-primary px-4 py-2">
+      <div className="flex shrink-0 items-center border-b border-separator-border px-4 py-2">
         <button type="button" onClick={onExit} disabled={exitBlocked} className="cursor-pointer rounded-md px-2 py-1 text-body-2-medium text-text-tertiary transition-colors duration-150 hover:text-text-primary disabled:cursor-not-allowed disabled:opacity-50">
           {t("plugins.conversationMode.exit")}
         </button>

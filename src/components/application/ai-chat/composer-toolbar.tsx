@@ -8,13 +8,15 @@ import { cx } from "@/utils/cx";
 
 /**
  * ComposerToolbar — the composer's bottom row: menu slots (add attachment,
- * CLI + model switcher, permission mode) on the left; the send button on the
- * right, which becomes a stop control while a turn streams.
+ * CLI + model switcher, permission mode) on the left; optional trailing
+ * controls and the send button on the right, which becomes a stop control
+ * while a turn streams.
  */
 export function ComposerToolbar({
   addMenu,
   cliMenu,
   permissionMenu,
+  trailing,
   streaming = false,
   disabled = false,
   disabledReason,
@@ -27,6 +29,8 @@ export function ComposerToolbar({
   cliMenu?: ReactNode;
   /** Slot for the permission-mode picker (PermissionMenu). */
   permissionMenu?: ReactNode;
+  /** Right-aligned controls placed just before send (context meter, …). */
+  trailing?: ReactNode;
   /** A turn is in flight: send becomes stop. */
   streaming?: boolean;
   /** Greys out send. */
@@ -51,6 +55,8 @@ export function ComposerToolbar({
       {permissionMenu}
 
       <div aria-hidden className="min-w-0 flex-1" />
+
+      {trailing}
 
       {streaming ? (
         <button
@@ -80,14 +86,14 @@ export function ComposerToolbar({
                 onSend();
               }}
               className={cx(
-                "flex size-9 shrink-0 items-center justify-center rounded-full bg-button-primary p-2 transition-opacity duration-200 ease",
+                "flex size-9 shrink-0 items-center justify-center rounded-full bg-button-primary p-2 text-text-white disabled:text-button-primary-disabled-foreground aria-disabled:text-button-primary-disabled-foreground transition-opacity duration-200 ease",
                 // 键盘可达正是这条分支的意义（原生 disabled 收不到 focus），
                 // 所以焦点环必须显式给上。
                 "outline-none focus-visible:ring-2 focus-visible:ring-border-focus-ring",
                 disabled ? "cursor-not-allowed opacity-50" : "cursor-pointer",
               )}
             >
-              <ArrowUp className="size-5 text-text-white" aria-hidden />
+              <ArrowUp className="size-5" aria-hidden />
             </button>
           </Focusable>
           <TooltipContent>{disabledReason}</TooltipContent>
@@ -99,13 +105,13 @@ export function ComposerToolbar({
           disabled={disabled}
           onClick={onSend}
           className={cx(
-            "flex size-9 shrink-0 cursor-pointer items-center justify-center rounded-full bg-button-primary p-2 transition-opacity duration-200 ease",
+            "flex size-9 shrink-0 cursor-pointer items-center justify-center rounded-full bg-button-primary p-2 text-text-white disabled:text-button-primary-disabled-foreground aria-disabled:text-button-primary-disabled-foreground transition-opacity duration-200 ease",
             // 与上面那条禁用分支统一到 opacity-50（§3：禁用态 50~60）：同一个
             // 发送键不该因为「有没有解释」而在两种灰之间跳。
             disabled && "cursor-not-allowed opacity-50",
           )}
         >
-          <ArrowUp className="size-5 text-text-white" aria-hidden />
+          <ArrowUp className="size-5" aria-hidden />
         </button>
       )}
     </div>

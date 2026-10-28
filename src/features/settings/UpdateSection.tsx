@@ -9,6 +9,8 @@ import {
 import { getAppVersion } from "@/lib/platform";
 import { useUpdateStore, type UpdateStage } from "@/features/update/store";
 import { useUpdateDescription } from "@/features/update/stage-message";
+import { useReleaseNotesTabStore } from "@/features/update/notes-tab";
+import { dismissCenterSurfaces } from "@/features/chat/center-surfaces";
 
 /** Update page: app identity + version and the check-for-updates row. */
 export function UpdateSection() {
@@ -64,6 +66,21 @@ export function UpdateSection() {
             <span className="text-body-regular text-text-secondary">
               {version ? `v${version}` : "…"}
             </span>
+          </SettingsRow>
+          <SettingsRow label={t("commands.openReleaseNotes")}>
+            <Button
+              size="small"
+              variant="secondary"
+              onClick={() => {
+                // 更新说明是聊天路由上的中心页签：先离开设置，再清场并打开
+                // （同命令面板 builtin:openReleaseNotes）。
+                window.location.hash = "#/";
+                dismissCenterSurfaces();
+                useReleaseNotesTabStore.getState().openTab();
+              }}
+            >
+              {t("settings.releaseNotesOpen")}
+            </Button>
           </SettingsRow>
           <SettingsRow anchor="checkUpdates" label={t("settings.checkUpdates")} description={updateDescription}>
             <UpdateControls

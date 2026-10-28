@@ -33,7 +33,7 @@ export function QuestionDock() {
   if (!pending) return null;
   return (
     <div className={centerColumnClass(wide)}>
-      <div className="rounded-xl border border-border-secondary bg-background-secondary-default px-3.5 py-3 shadow-lg">
+      <div className="rounded-xl border border-separator-border bg-background-secondary-default px-3.5 py-3 shadow-lg">
         <QuestionCard message={pending} />
       </div>
     </div>

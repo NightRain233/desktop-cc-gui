@@ -308,7 +308,7 @@ function EmptyPane({
           startNewChat(workspacePath);
           focusComposerWhenVisible(composerBridgeRef);
         }}
-        className="cursor-pointer rounded-md border border-border-secondary bg-background-secondary-default px-2.5 py-1 text-caption-1-medium text-text-secondary transition-colors hover:bg-background-tertiary-hover disabled:cursor-not-allowed disabled:opacity-60"
+        className="cursor-pointer rounded-md border border-separator-border bg-background-secondary-default px-2.5 py-1 text-caption-1-medium text-text-secondary transition-colors hover:bg-background-tertiary-hover disabled:cursor-not-allowed disabled:opacity-60"
       >
         {t("chat.emptyPaneNewChat")}
       </button>

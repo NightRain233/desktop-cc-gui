@@ -711,7 +711,7 @@ export const en: Messages = {
     restartNow: "Restart now",
     sidebarThreadLimit: "Sessions shown per workspace",
     uiZoom: "Interface zoom",
-    uiZoomDesc: "Syncs with the status bar ± buttons and zoom shortcuts",
+    uiZoomDesc: "Syncs with zoom shortcuts",
     contentFontSize: "Content font size",
     contentFontSizeDesc: "Base text size for chat messages",
     codeFontSize: "Code font size",
@@ -816,9 +816,9 @@ export const en: Messages = {
     sendShortcutEnter: "Enter",
     sendShortcutCmdEnter: "Cmd+Enter",
     sendShortcutCmdEnterCtrl: "Ctrl+Enter",
-    thinkingAutoCollapse: "Fold thinking when it finishes",
+    thinkingAutoCollapse: "Fold thinking and tool calls when done",
     thinkingAutoCollapseDesc:
-      "Turn off to keep the thinking process expanded during the turn; click the header to fold it manually",
+      "Folds thinking and tool calls once the answer starts or the turn ends, and keeps them folded when reopening history; turn off to keep them expanded (click the header to fold manually)",
     fileTreeHideIgnored: "Hide Git-ignored files in the file tree",
     fileTreeHideIgnoredDesc:
       "Hide files and folders ignored by .gitignore (including .git); when off they are shown faded",
@@ -848,6 +848,7 @@ export const en: Messages = {
     communityQrAlt: "Official WeChat community QR code",
     socialTitle: "Follow Us",
     socialDocs: "Documentation",
+    releaseNotesOpen: "View",
     checkUpdates: "Check for Updates",
     updateChecking: "Checking for updates…",
     updateLatest: "You're up to date",

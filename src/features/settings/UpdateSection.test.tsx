@@ -6,6 +6,11 @@ vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 vi.mock("@tauri-apps/plugin-updater", () => ({ check: vi.fn() }));
 vi.mock("@tauri-apps/plugin-process", () => ({ relaunch: vi.fn() }));
 vi.mock("@/lib/transport", () => ({ isWeb: false }));
+// 「查看版本更新说明」先清场再开页签；清场模块会连带拉起整套 chat store / ipc。
+const dismissCenterSurfacesSpy = vi.hoisted(() => vi.fn());
+vi.mock("@/features/chat/center-surfaces", () => ({
+  dismissCenterSurfaces: dismissCenterSurfacesSpy,
+}));
 vi.mock("@/lib/platform", () => ({
   getAppVersion: async () => "1.0.5",
   openExternal: vi.fn(),
@@ -13,6 +18,7 @@ vi.mock("@/lib/platform", () => ({
 
 import "@/lib/i18n";
 import { useUpdateStore } from "@/features/update/store";
+import { useReleaseNotesTabStore } from "@/features/update/notes-tab";
 import { UpdateSection } from "./UpdateSection";
 
 // React 18's act() requires this flag to be set by the test environment.
@@ -114,5 +120,19 @@ describe("UpdateSection update row", () => {
     expect(container.textContent).toContain("更新失败：network down");
     expect(rowButton("立即更新")).toBeUndefined();
     expect(rowButton("检查更新")!.disabled).toBe(false);
+  });
+
+  it("release notes: the version card opens the release-notes tab (moved off the status bar)", async () => {
+    useReleaseNotesTabStore.setState({ open: false, active: false });
+    window.location.hash = "#/settings";
+    await render();
+
+    expect(container.textContent).toContain("v1.0.5");
+    const view = rowButton("查看");
+    expect(view).not.toBeUndefined();
+    await act(async () => view!.click());
+    expect(dismissCenterSurfacesSpy).toHaveBeenCalledTimes(1);
+    expect(useReleaseNotesTabStore.getState()).toMatchObject({ open: true, active: true });
+    expect(window.location.hash).toBe("#/");
   });
 });

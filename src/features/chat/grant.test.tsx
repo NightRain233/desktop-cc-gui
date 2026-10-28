@@ -201,4 +201,23 @@ describe("GrantCard", () => {
     expect(container.textContent).not.toContain(i18n.t("chat.grantAllow"));
     expect(container.textContent).not.toContain(i18n.t("chat.grantDecline"));
   });
+
+  it("declined card collapses to one muted line without card chrome", () => {
+    render({
+      seq: 9,
+      role: "grant",
+      text: "Claude requested permissions to use Bash, but you haven't granted it yet.",
+      path: null,
+      ts: null,
+      grant: { status: "declined" },
+    });
+    const row = container.querySelector<HTMLElement>('[data-grant-status="declined"]');
+    expect(row).not.toBeNull();
+    expect(row!.textContent).toContain(i18n.t("chat.grantTitleAction"));
+    expect(row!.textContent).toContain(i18n.t("chat.grantDeclined"));
+    // 已处理的请求不再占一张卡：无边框、无正文复述、无操作按钮。
+    expect(row!.className).not.toContain("border");
+    expect(row!.textContent).not.toContain("Claude requested permissions");
+    expect(container.querySelector("button")).toBeNull();
+  });
 });

@@ -66,7 +66,9 @@ async function render(
       <ProcessDisclosure
         items={items}
         autoExpand={props.autoExpand ?? true}
-        turnLive={props.turnLive}
+        // Default to a live latest run: a settled latest run now mounts
+        // folded (auto-collapse), and most suites here inspect the body.
+        turnLive={props.turnLive ?? true}
         answered={props.answered}
         thinkingAutoCollapse={props.thinkingAutoCollapse}
         processId={1}
@@ -219,6 +221,21 @@ describe("ProcessDisclosure bounded history", () => {
 });
 
 describe("ProcessDisclosure tool args", () => {
+  it("collapsed shell rows preview the first command line instead of 「参数」", async () => {
+    const bashItem: ProcessItem = {
+      type: "tool",
+      text: "Bash",
+      args: { command: "\n  git clone --depth 1 https://example.com/repo.git\ncd repo" },
+    };
+    await render([bashItem]);
+    const toggle = [...container.querySelectorAll("button")].find((el) =>
+      el.getAttribute("aria-label")?.includes("展开工具参数"),
+    )!;
+    expect(toggle.textContent).toBe("git clone --depth 1 https://example.com/repo.git");
+    expect(toggle.getAttribute("title")).toBe("git clone --depth 1 https://example.com/repo.git");
+    expect(toggle.textContent).not.toContain("参数");
+  });
+
   it("hides args until the tool row is expanded", async () => {
     await render();
     expect(container.textContent).toContain("Read");
@@ -302,6 +319,47 @@ describe("ProcessDisclosure tool args", () => {
     expect(container.textContent).toContain("执行结果");
 
     expect(container.textContent).toContain("On branch main");
+  });
+});
+
+describe("ProcessDisclosure completed-turn folding", () => {
+  const toolRun: ProcessItem[] = [
+    { type: "tool", text: "Bash", args: { command: "git status" } },
+    { type: "tool", text: "Bash", args: { command: "git log -1" } },
+  ];
+
+  it("folds a tool-only run when the turn ends (it used to stay open)", async () => {
+    await render(toolRun, { turnLive: true });
+    expect(headerExpanded()).toBe(true);
+
+    await render(toolRun, { turnLive: false });
+    expect(headerExpanded()).toBe(false);
+  });
+
+  it("folds a tool-only run once answer text follows it", async () => {
+    await render(toolRun, { turnLive: true });
+    await render(toolRun, { turnLive: true, answered: true });
+    expect(headerExpanded()).toBe(false);
+  });
+
+  it("mounts a settled latest run folded (history load / session switch)", async () => {
+    await render(toolRun, { turnLive: false, answered: true });
+    expect(headerExpanded()).toBe(false);
+  });
+
+  it("keeps the old open-on-mount behaviour when auto-collapse is off", async () => {
+    await render(toolRun, { turnLive: false, thinkingAutoCollapse: false });
+    expect(headerExpanded()).toBe(true);
+    await render(toolRun, { turnLive: false, answered: true, thinkingAutoCollapse: false });
+    expect(headerExpanded()).toBe(true);
+  });
+
+  it("a click still reopens a folded completed run", async () => {
+    await render(toolRun, { turnLive: false });
+    await act(async () => {
+      container.querySelector<HTMLButtonElement>("button[aria-expanded]")!.click();
+    });
+    expect(headerExpanded()).toBe(true);
   });
 });
 

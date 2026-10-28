@@ -27,7 +27,6 @@ vi.mock("@/lib/platform", () => ({
 
 import { AppStatusBar } from "./app-status-bar";
 import { getAppVersion } from "@/lib/platform";
-import { useReleaseNotesTabStore } from "@/features/update/notes-tab";
 import { statusBarRegistry } from "@ccgui/plugin-sdk";
 import type { Disposer } from "@ccgui/plugin-sdk";
 
@@ -141,17 +140,9 @@ describe("AppStatusBar plugin items (plan §4.2 #8)", () => {
     }
   });
 });
-describe("AppStatusBar version chip", () => {
-  afterEach(() => {
-    // The shared platform mock defaults to no version; restore it so the
-    // plugin-items suite keeps rendering without the chip.
-    vi.mocked(getAppVersion).mockResolvedValue(null);
-    useReleaseNotesTabStore.setState({ open: false, active: false });
-  });
-
-  it("opens the release-notes center tab when the version chip is clicked", async () => {
+describe("AppStatusBar slimmed chrome", () => {
+  it("keeps version and zoom controls out of the bar", async () => {
     vi.mocked(getAppVersion).mockResolvedValue("1.0.2");
-    useReleaseNotesTabStore.setState({ open: false, active: false });
     const container = document.createElement("div");
     document.body.appendChild(container);
     const root = createRoot(container);
@@ -159,19 +150,16 @@ describe("AppStatusBar version chip", () => {
       await act(async () => {
         root.render(<AppStatusBar />);
       });
-      const chip = [...container.querySelectorAll("button")].find(
-        (b) => b.textContent === "v1.0.2",
-      );
-      expect(chip).toBeDefined();
-      await act(async () => {
-        chip!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
-      });
-      // 版本号不再是弹窗：它打开（并聚焦）更新说明页签；页签自己带「检查
-      // 更新」入口，按版本翻页的历史弹窗已下线。
-      expect(useReleaseNotesTabStore.getState()).toMatchObject({ open: true, active: true });
-      expect(chip!.getAttribute("aria-label")).toBe(i18n.t("changelog.title"));
-      expect(chip!.getAttribute("title")).toBe(i18n.t("commands.openReleaseNotes"));
+      // 版本号在 设置 → 更新，缩放走快捷键 / 设置页：状态栏都不再常驻。
+      expect(container.textContent).not.toContain("v1.0.2");
+      expect(container.querySelector(`[aria-label="${i18n.t("statusbar.zoomIn")}"]`)).toBeNull();
+      expect(container.querySelector(`[aria-label="${i18n.t("statusbar.zoomOut")}"]`)).toBeNull();
+      // 性能标签只在悬停 / 聚焦时展开，常态只剩图标。
+      const perf = container.querySelector(`[aria-label="${i18n.t("diagnostics.open")}"]`);
+      expect(perf?.className).toContain("group");
+      expect(perf?.querySelector("span")?.className).toContain("hidden");
     } finally {
+      vi.mocked(getAppVersion).mockResolvedValue(null);
       await act(async () => {
         root.unmount();
       });

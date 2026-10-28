@@ -2,7 +2,9 @@ import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } fro
 import { useTranslation } from "react-i18next";
 import {
   Composer,
+  ComposerContextControls,
   StatusBar,
+  type StatusBarProps,
   type ComposerInputHandle,
 } from "@/components/application/ai-chat/ai-chat-composer";
 import { MessageQueue } from "@/components/application/ai-chat/message-queue";
@@ -161,6 +163,7 @@ function FooterComposer({
   supportsImages,
   onPasteImages,
   onPastePaths,
+  toolbarTrailing,
 }: {
   active: ActiveSession | null;
   draft: string;
@@ -178,6 +181,7 @@ function FooterComposer({
   supportsImages: boolean;
   onPasteImages: (files: File[]) => void;
   onPastePaths?: (paths: string[]) => void;
+  toolbarTrailing: ReactNode;
 }) {
   const wide = useChatStore((s) => s.wideLayout);
   const { t } = useTranslation();
@@ -211,6 +215,7 @@ function FooterComposer({
       onPasteImages={supportsImages ? onPasteImages : undefined}
       onPastePaths={onPastePaths}
       workspacePath={active?.workspacePath}
+      toolbarTrailing={toolbarTrailing}
     />
   );
 }
@@ -218,7 +223,10 @@ function FooterComposer({
 /** Branch/folder/usage status bar under the composer. The quick-switch
  * folder chip mirrors the sidebar: archived workspaces stay hidden until
  * unarchived. */
-function FooterStatusBar({
+/** State and handlers behind the composer's context controls and the row under
+ *  it (folder / branch). Lifted to a hook so the composer toolbar and the
+ *  status row read one copy: compaction latches and busy flags must not fork. */
+function useFooterStatusBarProps({
   active,
   streaming,
   workspaces,
@@ -260,7 +268,6 @@ function FooterStatusBar({
   const workspaceAliases = useChatStore((s) => s.workspaceAliases);
   const compactContext = useChatStore((s) => s.compactContext);
   const refreshSessionUsage = useChatStore((s) => s.refreshSessionUsage);
-  const wide = useChatStore((s) => s.wideLayout);
   const [compacting, setCompacting] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
 
@@ -419,39 +426,36 @@ function FooterStatusBar({
     [visibleWorkspaces, startNewChat],
   );
 
-  return (
-    <div className={centerColumnClass(wide)}>
-      <StatusBar
-        branch={branch}
-        branches={branches}
-        branchRepoName={branchRepoName}
-        onBranchSelect={onBranchSelect}
-        folders={statusFolders}
-        selectedFolder={
-          active
-            ? (() => {
-                const workspace = workspaces.find((w) => w.path === active.workspacePath);
-                const alias = workspace ? workspaceAliases[workspace.id]?.trim() : "";
-                return alias || baseName(active.workspacePath);
-              })()
-            : undefined
-        }
-        onFolderSelect={handleFolderSelect}
-        usagePct={usage?.pct}
-        contextMax={contextMax}
-        contextSegments={contextSegments}
-        onCompactContext={handleCompact}
-        onRefreshUsage={handleRefresh}
-        compacting={compacting}
-        refreshing={refreshing}
-        canCompact={Boolean(active) && !streaming && !compacting}
-        autoCompact={autoCompact}
-        autoCompactDisabled={!sessionKeyValue}
-        onAutoCompactEnabledChange={(enabled) => setAutoCompactEnabled(sessionKeyValue, enabled)}
-        onAutoCompactThresholdChange={(threshold) => setAutoCompactThreshold(sessionKeyValue, threshold)}
-      />
-    </div>
-  );
+  const selectedFolder = active
+    ? (() => {
+        const workspace = workspaces.find((w) => w.path === active.workspacePath);
+        const alias = workspace ? workspaceAliases[workspace.id]?.trim() : "";
+        return alias || baseName(active.workspacePath);
+      })()
+    : undefined;
+
+  return {
+    branch,
+    branches,
+    branchRepoName,
+    onBranchSelect,
+    folders: statusFolders,
+    selectedFolder,
+    onFolderSelect: handleFolderSelect,
+    usagePct: usage?.pct,
+    contextMax,
+    contextSegments,
+    onCompactContext: handleCompact,
+    onRefreshUsage: handleRefresh,
+    compacting,
+    refreshing,
+    canCompact: Boolean(active) && !streaming && !compacting,
+    autoCompact,
+    autoCompactDisabled: !sessionKeyValue,
+    onAutoCompactEnabledChange: (enabled: boolean) => setAutoCompactEnabled(sessionKeyValue, enabled),
+    onAutoCompactThresholdChange: (threshold: number) =>
+      setAutoCompactThreshold(sessionKeyValue, threshold),
+  } satisfies StatusBarProps;
 }
 
 /** Attachment preview lightbox; hidden until a chip is clicked. */
@@ -576,6 +580,21 @@ export function ConversationFooter({
     onDropPaths,
     onDropFiles,
   });
+  const statusBarProps = useFooterStatusBarProps({
+    active,
+    streaming,
+    workspaces,
+    sessionUsage,
+    contextMax,
+    branch,
+    branches,
+    branchRepoName,
+    onBranchSelect,
+    startNewChat,
+  });
+  // The docks take the composer's slot; the context meter then falls back to
+  // the row underneath so it is never unreachable.
+  const composerShown = !pendingPlan && !pendingQuestion;
 
   return (
     <>
@@ -622,20 +641,12 @@ export function ConversationFooter({
             supportsImages={supportsImages}
             onPasteImages={onPasteImages}
             onPastePaths={onPastePaths}
+            toolbarTrailing={<ComposerContextControls {...statusBarProps} />}
           />
         )}
-        <FooterStatusBar
-          active={active}
-          streaming={streaming}
-          workspaces={workspaces}
-          sessionUsage={sessionUsage}
-          contextMax={contextMax}
-          branch={branch}
-          branches={branches}
-          branchRepoName={branchRepoName}
-          onBranchSelect={onBranchSelect}
-          startNewChat={startNewChat}
-        />
+        <div className={centerColumnClass(wideLayout)}>
+          <StatusBar {...statusBarProps} hideContextControls={composerShown} />
+        </div>
 
       </div>
       <AttachmentLightbox zoom={zoomImage} onClose={() => setZoomImage(null)} />
