@@ -1509,6 +1509,16 @@ pub async fn interrupt_session(
         .await
         .map_err(|e| e.to_string())
 }
+/// Which of `run_ids` the host still runs. The frontend's orphan sweep asks
+/// before settling a run that went silent: a long command or a question
+/// waiting on the user emits nothing, and silence alone is not a dead run.
+#[tauri::command]
+pub async fn live_runs(
+    state: tauri::State<'_, crate::AppState>,
+    run_ids: Vec<String>,
+) -> Result<Vec<String>, String> {
+    Ok(state.processes.live_run_ids(&run_ids))
+}
 /// Answer a pending question card. Multiple transports share this command:
 /// - claude (control protocol): the answers merge into the parked tool input
 ///   and ride stdin as a `control_response`.

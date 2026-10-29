@@ -16,6 +16,7 @@ import {
   applyStreamParts,
   bufferStreamPart,
   drainPending,
+  dropOrphanRun,
   migratePendingStream,
   moveRetryingFlag,
   moveStreamingFlag,
@@ -984,7 +985,7 @@ function onSession(
       ?.catch(() => {});
   }
 
-  settleOrphanedRuns(deps.set, routeRun(event.runId, newKey));
+  void reapOrphanedRuns(deps.set, routeRun(event.runId, newKey));
   // Unflushed stream chunks sit under the pre-migration key; move them too.
   migratePendingStream(fromKey, newKey);
   // A delta-only engine reports no native id from the send, so a remembered
@@ -1135,6 +1136,37 @@ export function dropRunUsage(runId: string) {
   turnUsageTotals.delete(runId);
   liveLedgerRuns.delete(runId);
   dropStreamDisplayContext(runId);
+}
+
+/** Settle the stale runs routeRun reported, but only those the host no
+ * longer runs. Silence is not death: a long command or a question left
+ * waiting emits nothing, and settling it would stop the spinner (and fire a
+ * failed afterTurn) under a live turn. A live run is re-stamped, so it is
+ * asked about again only after another silent TTL; a failed check keeps
+ * every candidate routed for the next sweep to retry. */
+export async function reapOrphanedRuns(
+  set: (fn: (s: ChatStore) => Partial<ChatStore>) => void,
+  candidates: Array<[string, string]>,
+) {
+  if (candidates.length === 0) return;
+  let live: string[];
+  try {
+    live = await ipc.liveRuns(candidates.map(([runId]) => runId));
+  } catch (error) {
+    console.warn("Orphan sweep could not check live runs:", errorText(error));
+    return;
+  }
+  const alive = new Set(live);
+  const orphaned: Array<[string, string]> = [];
+  for (const [runId] of candidates) {
+    if (alive.has(runId)) {
+      touchRun(runId);
+      continue;
+    }
+    const key = dropOrphanRun(runId);
+    if (key !== undefined) orphaned.push([runId, key]);
+  }
+  settleOrphanedRuns(set, orphaned);
 }
 
 /** Drop every trace of runs the orphan sweep reaped: their usage maps here
@@ -1954,7 +1986,7 @@ function adoptObservedRun(
   deps: EngineEventDeps,
 ) {
   if (!runRouting.has(event.runId)) {
-    settleOrphanedRuns(deps.set, routeRun(event.runId, key));
+    void reapOrphanedRuns(deps.set, routeRun(event.runId, key));
   }
   const cur = deps.get().bySession[key];
   if (!cur?.streaming) {
@@ -2040,7 +2072,7 @@ export function handleEngineEvents(
     if (bindUnboundRun(event)) {
       const lifecycle = runLifecycles.get(event.runId);
       if (lifecycle) {
-        settleOrphanedRuns(
+        void reapOrphanedRuns(
           deps.set,
           routeRun(
             event.runId,
