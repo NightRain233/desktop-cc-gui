@@ -3,9 +3,15 @@ import type { EngineEventPayload } from "@/lib/events";
 
 const sendMock = vi.fn();
 const interruptMock = vi.fn();
+const storeState = {
+  send: sendMock,
+  interrupt: interruptMock,
+  sessions: [] as Array<{ engine: string; sessionId: string; workspacePath: string }>,
+  streamingByKey: {} as Record<string, true>,
+};
 vi.mock("@/features/chat/store", () => ({
   useChatStore: {
-    getState: () => ({ send: sendMock, interrupt: interruptMock }),
+    getState: () => storeState,
   },
 }));
 
@@ -29,6 +35,8 @@ describe("plugin session-run bridge", () => {
     sendMock.mockReset();
     interruptMock.mockReset();
     interruptMock.mockResolvedValue(undefined);
+    storeState.sessions = [];
+    storeState.streamingByKey = {};
   });
 
   it("sends through the chat store with per-run overrides and reports terminal events", async () => {
@@ -137,5 +145,39 @@ describe("plugin session-run bridge", () => {
     );
     // Settle the owned run so its record cannot leak into later tests.
     emitEngineEvents?.([engineEvent("run-owned", "done", { sessionId: "sess-owned" })]);
+  });
+
+  it("sends to an existing session, rejects busy targets, and queues in order", async () => {
+    const { sendPluginSessionMessage } = await import("./session-run-bridge");
+    storeState.sessions = [{ engine: "pi", sessionId: "sess-a", workspacePath: "/w" }];
+    await expect(sendPluginSessionMessage("scheduler", {
+      engine: "pi", sessionId: "missing", workspacePath: "/w", prompt: "x",
+    })).rejects.toThrow(/unknown session/);
+    await expect(sendPluginSessionMessage("scheduler", {
+      engine: "pi", sessionId: "sess-a", workspacePath: "/w", prompt: " ",
+    })).rejects.toThrow(/requires/);
+    const sent: string[] = [];
+    sendMock.mockImplementation(async (prompt: string, _images: string[], options: { onStarted: (info: { runId: string; sessionId: string }) => void }, target: unknown) => {
+      sent.push(prompt);
+      expect(target).toEqual({ engine: "pi", sessionId: "sess-a", workspacePath: "/w" });
+      options.onStarted({ runId: `run-${sent.length}`, sessionId: "sess-a" });
+    });
+    await expect(sendPluginSessionMessage("scheduler", {
+      engine: "pi", sessionId: "sess-a", workspacePath: "/w", prompt: "first",
+    })).resolves.toEqual({ runId: "run-1", sessionId: "sess-a" });
+
+    storeState.streamingByKey["pi/sess-a"] = true;
+    await expect(sendPluginSessionMessage("scheduler", {
+      engine: "pi", sessionId: "sess-a", workspacePath: "/w", prompt: "reject", ifBusy: "reject",
+    })).rejects.toThrow(/busy/);
+    const queued = sendPluginSessionMessage("scheduler", {
+      engine: "pi", sessionId: "sess-a", workspacePath: "/w", prompt: "second", ifBusy: "queue",
+    });
+    expect(sent).toEqual(["first"]);
+    storeState.streamingByKey = {};
+    emitEngineEvents?.([engineEvent("run-1", "done", { sessionId: "sess-a" })]);
+    await expect(queued).resolves.toEqual({ runId: "run-2", sessionId: "sess-a" });
+    expect(sent).toEqual(["first", "second"]);
+    emitEngineEvents?.([engineEvent("run-2", "done", { sessionId: "sess-a" })]);
   });
 });

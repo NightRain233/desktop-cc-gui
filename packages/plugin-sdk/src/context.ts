@@ -791,6 +791,17 @@ export interface PluginContext {
       workspacePath: string;
       sessionId?: string | null;
     }): Promise<void>;
+    /** 向明确指定的已有会话发送消息（权限 `host:session:send`）。不会
+     *  创建会话，也不会读取当前活动标签页。目标会话忙碌时，`queue`
+     *  按该会话已有顺序等待，`reject` 立即以 busy 拒绝。返回的 runId
+     *  可用于 plugin-run://<pluginId> 的 started/done/error/cancelled 回执。 */
+    sendMessage(def: {
+      engine: string;
+      sessionId: string;
+      workspacePath: string;
+      prompt: string;
+      ifBusy?: "queue" | "reject";
+    }): Promise<{ runId: string; sessionId: string }>;
     registerSource(def: {
       /** 源 id,插件内唯一;同 id 重复登记覆盖(热重载语义)。 */
       id: string;

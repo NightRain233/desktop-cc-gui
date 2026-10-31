@@ -1,5 +1,9 @@
 # @ccgui/plugin-sdk changelog
 
+## 0.3.23 — 2026-11-01
+
+- 新增独立权限 `host:session:send` 与 `ctx.sessions.sendMessage()`：向明确指定的已有会话发送消息，支持 `ifBusy: "queue" | "reject"`，返回 `runId` 并通过 `plugin-run://<pluginId>` 回执 started / done / error / cancelled。宿主校验 engine + sessionId + workspacePath，插件卸载时清理排队与运行中的发送。
+
 ## 0.3.22 — 2026-10-26
 
 - 新增权限 `ui:worktree-badge` 与 `ctx.ui.registerWorktreeBadges(def)`：把一块标签推到侧栏「WORKTREES」子行上，返回 `WorktreeBadgeHandle`。

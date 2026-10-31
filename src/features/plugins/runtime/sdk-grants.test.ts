@@ -33,6 +33,7 @@ describe("isKnownPermission", () => {
       "host:worktree",
       "host:window",
       "host:models",
+      "host:session:send",
     ]) {
       expect(isKnownPermission(permission)).toBe(true);
     }

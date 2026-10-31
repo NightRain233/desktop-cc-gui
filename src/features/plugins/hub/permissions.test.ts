@@ -9,6 +9,7 @@ describe("describePermission", () => {
       "plugins.hub.permissions.composerDraft",
     );
     expect(describePermission("host:session").key).toBe("plugins.hub.permissions.hostSession");
+    expect(describePermission("host:session:send").key).toBe("plugins.hub.permissions.hostSessionSend");
     expect(describePermission("network:none").key).toBe("plugins.hub.permissions.networkNone");
   });
 

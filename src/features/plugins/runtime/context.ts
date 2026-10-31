@@ -50,7 +50,11 @@ import { dismissCenterSurfaces } from "@/features/chat/center-surfaces";
 import { addPluginWorkspace, listPluginWorkspaces, openPluginSession } from "./workspace-bridge";
 import { createWorktreeBadgeHandle } from "./worktree-badges";
 import { createPluginWorktree, removePluginWorktree } from "./worktree-bridge";
-import { interruptPluginChatRun, startPluginChatRun } from "./session-run-bridge";
+import {
+  interruptPluginChatRun,
+  sendPluginSessionMessage,
+  startPluginChatRun,
+} from "./session-run-bridge";
 import { registerSessionSource } from "./session-source";
 import { directoryAssetUrl, fileAssetUrl, remoteAssetUrl } from "./asset-url";
 import { usePluginTabsStore } from "./center-tabs";
@@ -717,6 +721,10 @@ export function createPluginContext(
       interruptRun(def) {
         requirePermission("host:session");
         return Promise.resolve().then(() => interruptPluginChatRun(id, def));
+      },
+      sendMessage(def) {
+        requirePermission("host:session:send");
+        return Promise.resolve().then(() => sendPluginSessionMessage(id, def));
       },
       registerSource(def) {
         requirePermission("host:session");

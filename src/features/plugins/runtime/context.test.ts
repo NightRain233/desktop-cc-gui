@@ -44,6 +44,7 @@ vi.mock("./worktree-bridge", () => ({ createPluginWorktree: vi.fn(async () => ({
 vi.mock("./session-run-bridge", () => ({
   startPluginChatRun: vi.fn(async () => ({ runId: "run-1", sessionId: "sess-1" })),
   interruptPluginChatRun: vi.fn(async () => undefined),
+  sendPluginSessionMessage: vi.fn(async () => ({ runId: "run-send-1", sessionId: "sess-1" })),
 }));
 
 function fakeStorage(): PluginContextBackend & {
@@ -546,6 +547,24 @@ describe("createPluginContext", () => {
     expect(() => ctx.sessions.interruptRun({ engine: "pi", workspacePath: "/w" })).toThrow(
       /host:session/,
     );
+  });
+
+  it("sessions.sendMessage requires its dedicated permission and delegates the explicit target", async () => {
+    const bridge = await import("./session-run-bridge");
+    const backend = fakeStorage();
+    const { ctx } = createPluginContext(manifest(["host:session:send"]), backend, { appVersion: "1" });
+    const def = {
+      engine: "pi",
+      sessionId: "sess-1",
+      workspacePath: "/w",
+      prompt: "run the report",
+      ifBusy: "queue" as const,
+    };
+    await expect(ctx.sessions.sendMessage(def)).resolves.toEqual({ runId: "run-send-1", sessionId: "sess-1" });
+    expect(bridge.sendPluginSessionMessage).toHaveBeenCalledWith("test-plugin", def);
+
+    const denied = createPluginContext(manifest(["host:session"]), backend, { appVersion: "1" });
+    expect(() => denied.ctx.sessions.sendMessage(def)).toThrow(/host:session:send/);
   });
 
   it("storage round-trips through the backend in the plugin's namespace", async () => {

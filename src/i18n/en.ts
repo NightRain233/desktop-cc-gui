@@ -1671,6 +1671,7 @@ export const en: Messages = {
         agent: "Run plugin agents",
         composerDraft: "Read and write the composer draft",
         hostSession: "Read the active session",
+        hostSessionSend: "Send messages to an explicitly selected session",
         hostWorkspace: "Read the active workspace",
         hostWorkspaceRemote: "Access remote workspaces",
         hostWorktree: "Create local worktrees",

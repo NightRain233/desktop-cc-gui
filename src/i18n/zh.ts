@@ -1611,6 +1611,7 @@ export const zh = {
         agent: "运行插件智能体",
         composerDraft: "读写输入框草稿",
         hostSession: "读取当前会话",
+        hostSessionSend: "向明确选择的已有会话发送消息",
         hostWorkspace: "读取当前工作区",
         hostWorkspaceRemote: "访问远程工作区",
         hostWorktree: "创建本地 Worktree",

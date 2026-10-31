@@ -1,7 +1,7 @@
 <!-- 由 src/features/plugins/skill/creator-skill-docs.ts 从源码生成，请勿手改。 -->
 <!-- 重新生成：pnpm plugin-skill:docs（测试 creator-skill-docs.test.ts 会断言本文件与源码一致）。 -->
 
-# CC GUI 插件 SDK 参考（SDK 0.3.22）
+# CC GUI 插件 SDK 参考（SDK 0.3.23）
 
 本文件由脚本从 `packages/plugin-sdk`（公共契约）与宿主运行时（权限门禁）派生，属于 `ccgui-plugin-creator` skill。
 字段、方法、权限以本文件为准：**文中没有的 API 一律视为不存在**，不要凭记忆猜测方法名或权限名。
@@ -99,6 +99,7 @@ export default function activate(ctx: PluginContext): void | (() => void) {
 | `ctx.sessions.setEffort` | `host:session` | 修改已有会话的 effort 档位，0.3.10 起。直写宿主会话状态并持久化 （等价于用户在会话内切换档位，refreshSessions 不会回滚）。未知会话 或空 effort 以 rejection 失败——不会创建幽灵会话条目。 |
 | `ctx.sessions.startRun` | `host:session` | 把一个 AI 轮次跑成**宿主聊天会话**（0.3.18 起，权限 `host:session`）： 会话立刻出现在侧栏（带运行中状态，不需要手动同步），打开就是实时 流式输出；停止既能在聊天里点，也能用 `interruptRun`。会话挂在 `workspacePath` 工作区下，模型/强度/渠道只覆盖这一轮，不动用户的 全局默认。 与 `ctx.agent.start` 的分工：那个是插件自有的后台轮次（事件只回 插件，不进聊天）；这个就是「像用户自己发了一条」。需要用户看得见、 随时能接管/停止的轮次用本方法。 spawn 成功后 resolve `{ runId, sessionId }`（引擎稍后才 announce sessionId 时为 null）；轮次终止经 `plugin-run://<pluginId>` 事件回执： `{ runId, sessionId, engine, workspacePath, kind: "done" \| "error", error }`。 被用户/插件中断的轮次同样以 `done` 收尾。 |
 | `ctx.sessions.interruptRun` | `host:session` | 停止 `startRun` 起的轮次（等价于聊天里的停止按钮）。 |
+| `ctx.sessions.sendMessage` | `host:session:send` | 向明确指定的已有会话发送消息（权限 `host:session:send`）。不会 创建会话，也不会读取当前活动标签页。目标会话忙碌时，`queue` 按该会话已有顺序等待，`reject` 立即以 busy 拒绝。返回的 runId 可用于 plugin-run://<pluginId> 的 started/done/error/cancelled 回执。 |
 | `ctx.sessions.registerSource` | `host:session` | — |
 | `ctx.window.getState` | `host:window` | — |
 | `ctx.window.setNormalBounds` | `host:window` | — |
@@ -366,6 +367,8 @@ sessions: {
   startRun(def: { engine: string; prompt: string; workspacePath: string; model?: string | null; effort?: string | null; providerId?: string | null }): Promise<{ runId: string; sessionId: string | null }>;
   /** 权限：host:session */
   interruptRun(def: { engine: string; workspacePath: string; sessionId?: string | null }): Promise<void>;
+  /** 权限：host:session:send */
+  sendMessage(def: { engine: string; sessionId: string; workspacePath: string; prompt: string; ifBusy?: "queue" | "reject" }): Promise<{ runId: string; sessionId: string }>;
   /** 权限：host:session */
   registerSource(def: { id: string; list(): Promise<ExternalSessionRow[]> }): Disposer;
 }
@@ -475,6 +478,7 @@ ctx.react: typeof React; // Shared host React instance: external bundles can't r
 | `network:none` | — |
 | `composer:draft` | `ctx.composer.setDraft` |
 | `host:session` | `ctx.sessions.selectSession`、`ctx.sessions.refresh`、`ctx.sessions.setEffort`、`ctx.sessions.startRun`、`ctx.sessions.interruptRun`、`ctx.sessions.registerSource` |
+| `host:session:send` | `ctx.sessions.sendMessage` |
 | `host:workspace` | `ctx.workspaces.add`、`ctx.workspaces.list` |
 | `host:workspace:remote` | `ctx.workspaces.add` |
 | `host:worktree` | `ctx.worktrees.create`、`ctx.worktrees.remove` |

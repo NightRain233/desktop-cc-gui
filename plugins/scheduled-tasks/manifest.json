@@ -1,0 +1,9 @@
+{
+  "id": "scheduled-tasks",
+  "name": "定时任务",
+  "version": "0.1.0",
+  "description": "在指定已有会话中按计划发送消息",
+  "tier": "js",
+  "sdkVersion": ">=0.3.23",
+  "permissions": ["storage", "events", "ui:panel-tab", "host:session:send"]
+}
