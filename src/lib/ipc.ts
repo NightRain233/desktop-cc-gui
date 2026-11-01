@@ -1460,9 +1460,9 @@ export const ipc = {
       visibility: "internal";
       persistence: "turn" | "session";
     }>;
-    /** ccgui 自己拦下来的 `/compact`（底部按钮或内置 app 命令）：OMP 改走
-     *  原生 compact RPC 命令。用户自定义的同名目录命令不会带这个标记，
-     *  仍然作为普通提示词发给 CLI。 */
+    /** ccgui 自己拦下来的 `/compact`（底部按钮或内置 app 命令）：Pi/OMP
+     *  改走原生 compact RPC，Codex 改走 app-server compact。用户自定义的
+     *  同名目录命令不会带这个标记，仍然作为普通提示词发给 CLI。 */
     nativeCompact?: boolean;
     imagePaths: string[] | null;
     model: string | null;

@@ -352,6 +352,16 @@ impl Engine for CodexEngine {
     }
 
     fn build_command(&self, req: &SendRequest, bin: &str) -> Result<BuiltCommand, String> {
+        // A native compact is an app-server-only operation.  This method is
+        // used by the WSL/exec fallback, so never silently turn it into a
+        // `/compact` prompt (older app-servers and remote workspaces cannot
+        // persist the same compaction lifecycle).
+        if req.native_compact {
+            return Err(
+                "Codex 原生 /compact 需要本机 app-server；当前 exec/WSL 路径不支持手动压缩"
+                    .into(),
+            );
+        }
         if super::codex_read_only::requested(req) {
             return Err("Codex read-only planning requires the local app-server; exec/WSL fallback is forbidden".into());
         }
@@ -677,6 +687,17 @@ mod tests {
             memory_bot: None,
             allowed_tools: None,
         }
+    }
+
+    #[test]
+    fn native_compact_is_rejected_by_the_exec_fallback() {
+        let mut req = base_req();
+        req.native_compact = true;
+        let error = match CodexEngine.build_command(&req, "fake-bin") {
+            Ok(_) => panic!("exec/WSL must not downgrade native compact to a prompt"),
+            Err(error) => error,
+        };
+        assert!(error.contains("app-server"));
     }
 
     fn channel_command(provider: &Value, req: &SendRequest) -> tokio::process::Command {

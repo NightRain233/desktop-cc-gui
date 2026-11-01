@@ -590,7 +590,13 @@ fn prepare_launch(
         workspace: PathBuf::from(workspace_path),
         prompt: effective_prompt(&prompt, prompt_contributions),
         prompt_contributions: Vec::new(),
-        native_compact: native_compact.unwrap_or(false) && engine == "omp",
+        // The host marker is only attached to ccgui's built-in `/compact`.
+        // OMP/Pi use the Pi-family RPC command and local Codex uses the
+        // app-server `thread/compact/start` method.  Other engines must keep
+        // receiving ordinary prompt text (or fail explicitly in their own
+        // transport when a native path does not exist).
+        native_compact: native_compact.unwrap_or(false)
+            && matches!(engine, "omp" | "pi" | "codex"),
         images: image_paths.unwrap_or_default(),
         model,
         effort,

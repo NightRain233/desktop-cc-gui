@@ -119,6 +119,10 @@ struct TurnView {
     /// Last `thread/tokenUsage/updated` payload, folded into this turn's Done:
     /// the terminal notification itself carries no usage.
     last_usage: Option<Value>,
+    /// Native compaction must be evidenced by Codex's compaction item (or the
+    /// deprecated compacted notification); a plain turn completion is not
+    /// enough to claim that the persisted context changed.
+    compaction_completed: bool,
     exit_unconfirmed: bool,
     isolated_home: Option<std::path::PathBuf>,
     /// This run is a human-approved planning turn (`permission == "plan"`):
@@ -445,10 +449,27 @@ fn handle_notification(
                 }
             }
         }
+        // Current app-server versions persist a `contextCompaction` item;
+        // older versions emitted this notification instead. Both are native
+        // evidence that the thread's model context was rewritten.
+        "thread/compacted" => {
+            view.compaction_completed = true;
+            return Handled::Ended;
+        }
         "thread/started" => {
             if let Some(thread_id) = params.pointer("/thread/id").and_then(Value::as_str) {
                 core.dispatch_event(state, EngineEvent::SessionId(thread_id.to_string()));
             }
+        }
+        "turn/started" => {
+            // Compact starts can acknowledge with an empty response and carry
+            // the turn handle only in this notification. Keep it for the
+            // interrupt path and for protocol replay assertions.
+            view.turn_id = params
+                .pointer("/turn/id")
+                .or_else(|| params.get("turnId"))
+                .and_then(Value::as_str)
+                .map(str::to_string);
         }
         // The server moved this turn to another model (safety reroute): the
         // response's own account of what is answering, so the check flags it
@@ -527,6 +548,11 @@ fn handle_item(
     };
     let item_id = item.get("id").and_then(Value::as_str);
     match kind {
+        "contextCompaction" => {
+            if completed {
+                view.compaction_completed = true;
+            }
+        }
         "agentMessage" => {
             if !completed {
                 return;
@@ -1545,9 +1571,21 @@ async fn handshake_and_turn(
     )
     .await?
     else {
+        if req.native_compact && !view.compaction_completed {
+            return Err(
+                "Codex app-server completed /compact without a contextCompaction result"
+                    .to_string(),
+            );
+        }
         return Ok(());
     };
-    pump_turn_to_end(server, core, state, view, &started, killed).await
+    pump_turn_to_end(server, core, state, view, &started, killed).await?;
+    if req.native_compact && !view.compaction_completed {
+        return Err(
+            "Codex app-server completed /compact without a contextCompaction result".to_string(),
+        );
+    }
+    Ok(())
 }
 
 /// A turn whose `turn/start` the server has acknowledged.
@@ -1736,6 +1774,37 @@ async fn handshake_and_start(
                 effort: reported_effort.clone(),
             },
         );
+    }
+    if req.native_compact {
+        // This is a separate app-server command, deliberately kept out of
+        // `turn/start`: Codex persists the compacted rollout and reports a
+        // `contextCompaction` item while the command is running. Older
+        // app-servers reject the method and the caller surfaces that error;
+        // there is no fallback to a slash prompt.
+        let key = server
+            .request(
+                "thread/compact/start",
+                json!({ "threadId": thread_id }),
+            )
+            .await?;
+        let result = server
+            .pump(
+                "thread/compact/start",
+                Expect::Reply(&key),
+                Instant::now() + ack_timeout,
+                killed,
+                None,
+                &mut |value| route(core, state, view, value),
+            )
+            .await?;
+        let turn_id = result
+            .as_ref()
+            .and_then(|value| value.pointer("/turn/id").and_then(Value::as_str))
+            .map(str::to_string);
+        return Ok(Some(TurnStarted {
+            thread_id,
+            turn_id: turn_id.or_else(|| view.turn_id.clone()),
+        }));
     }
     // A decision turn may only start once the reviewed plan is proven live and
     // unchanged: re-fetch the final plan item from the thread and compare id +
@@ -2740,6 +2809,91 @@ require('node:readline').createInterface({input: process.stdin}).on('line', line
             let started = result.expect(mode).expect("turn must be acknowledged");
             assert_eq!(started.thread_id, "thread-123");
             assert_eq!(started.turn_id.as_deref(), Some("next-turn"));
+        }
+    }
+
+    #[tokio::test]
+    async fn native_compact_uses_compact_start_and_requires_compaction_evidence() {
+        // Fake app-server replay: a compact request is a thread command, not
+        // a turn/start carrying `/compact`. The command acknowledges with an
+        // empty result and then emits the canonical contextCompaction item.
+        let peer = r#"
+const assert = require('node:assert/strict');
+const reject = process.argv[1] === 'reject';
+let step = 0;
+require('node:readline').createInterface({input: process.stdin}).on('line', line => {
+  const {id, method, params} = JSON.parse(line);
+  const methods = ['initialize', 'thread/resume', 'thread/compact/start'];
+  assert.equal(method, methods[step++]);
+  if (method === 'initialize') {
+    assert.equal(params.capabilities.experimentalApi, true);
+    process.stdout.write(JSON.stringify({jsonrpc:'2.0', id, result:{}})+'\n');
+  } else if (method === 'thread/resume') {
+    assert.equal(params.threadId, 'thread-compact');
+    assert.equal(params.excludeTurns, true);
+    process.stdout.write(JSON.stringify({jsonrpc:'2.0', id, result:{thread:{id:'thread-compact'},model:'test-model'}})+'\n');
+  } else {
+    assert.deepEqual(params, {threadId:'thread-compact'});
+    if (reject) {
+      process.stdout.write(JSON.stringify({jsonrpc:'2.0', id, error:{code:-32601,message:'method not found'}})+'\n');
+      return;
+    }
+    process.stdout.write(JSON.stringify({jsonrpc:'2.0', id, result:{}})+'\n');
+    process.stdout.write(JSON.stringify({method:'turn/started', params:{turn:{id:'compact-turn'}}})+'\n');
+    process.stdout.write(JSON.stringify({method:'item/completed', params:{threadId:'thread-compact',item:{id:'compact-item',type:'contextCompaction'}}})+'\n');
+    process.stdout.write(JSON.stringify({method:'turn/completed', params:{turn:{status:'completed'}}})+'\n');
+  }
+});
+"#;
+        for mode in ["ok", "reject"] {
+            let mut child = Command::new("node")
+                .args(["-e", peer, mode])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()
+                .expect("protocol test requires Node");
+            let stdin = Arc::new(TokioMutex::new(child.stdin.take()));
+            let mut server = AppServer::new(stdin, child.stdout.take().unwrap());
+            let req = SendRequest {
+                session_id: Some("thread-compact".into()),
+                workspace: std::env::temp_dir(),
+                prompt: "/compact".into(),
+                prompt_contributions: Vec::new(),
+                native_compact: true,
+                images: Vec::new(),
+                model: None,
+                effort: None,
+                service_tier: None,
+                permission: Some("auto".into()),
+                additional_dirs: Vec::new(),
+                provider_id: None,
+                computer_use: None,
+                memory_bot: None,
+                allowed_tools: None,
+            };
+            let (core, _registry, _emitter) = test_core();
+            let killed = Arc::new(AtomicBool::new(false));
+            let mut state = TurnState::new(req.session_id.clone());
+            let mut view = TurnView::default();
+            let result = handshake_and_turn(
+                &mut server,
+                &core,
+                &mut state,
+                &mut view,
+                &req,
+                &killed,
+                None,
+            )
+            .await;
+            if mode == "ok" {
+                assert!(result.is_ok(), "{result:?}");
+                assert!(view.compaction_completed);
+            } else {
+                assert!(result.unwrap_err().contains("method not found"));
+                assert!(!view.compaction_completed);
+            }
+            let _ = timeout(Duration::from_secs(5), child.wait()).await;
         }
     }
 
