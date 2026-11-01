@@ -13,6 +13,7 @@ import {
 } from "./context";
 import { bridgePluginAgentEvents, bridgeUsageEvents } from "./events";
 import { installHardening, runAsPlugin } from "./hardening";
+import { cancelPluginSessionRuns } from "./session-run-bridge";
 import { validateManifest } from "./permissions";
 import { applyDeclarativePlugin } from "../declarative/interpreter";
 import {
@@ -339,6 +340,7 @@ export function unloadPlugin(id: string): void {
   const entry = active.get(id);
   if (!entry) return;
   active.delete(id);
+  cancelPluginSessionRuns(id);
   if (entry.cleanup) {
     try {
       runAsPlugin(entry.cleanup);

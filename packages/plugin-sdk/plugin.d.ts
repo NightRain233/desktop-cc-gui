@@ -6,7 +6,7 @@
  * 插件仓用法（包未发布 npm 前的过渡方案）：复制本文件为插件仓的
  * `src/ccgui-plugin.d.ts`，首行版本戳必须与所用宿主 SDK 一致。
  *
- * @ccgui/plugin-sdk v0.3.22
+ * @ccgui/plugin-sdk v0.3.23
  */
 
 /** 宿主实现的 SDK 契约版本。 */
@@ -827,6 +827,17 @@ export interface PluginContext {
       workspacePath: string;
       sessionId?: string | null;
     }): Promise<void>;
+    /** 向明确指定的已有会话发送消息(权限 host:session:send)。不会创建
+     *  会话,也不会读取当前活动标签页。目标忙碌时 queue 按会话顺序等待,
+     *  reject 立即以 busy 拒绝。返回 runId 并通过 plugin-run://<pluginId>
+     *  回执 started/done/error/cancelled。 */
+    sendMessage(def: {
+      engine: string;
+      sessionId: string;
+      workspacePath: string;
+      prompt: string;
+      ifBusy?: "queue" | "reject";
+    }): Promise<{ runId: string; sessionId: string }>;
     registerSource(def: {
       /** 源 id,插件内唯一;同 id 重复登记覆盖(热重载语义)。 */
       id: string;

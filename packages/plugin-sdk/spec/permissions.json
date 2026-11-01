@@ -25,6 +25,7 @@
     "network:none",
     "composer:draft",
     "host:session",
+    "host:session:send",
     "host:workspace",
     "host:workspace:remote",
     "host:worktree",

@@ -21,6 +21,7 @@ const BASE_LABELS: Record<string, string> = {
   agent: "agent",
   "composer:draft": "composerDraft",
   "host:session": "hostSession",
+  "host:session:send": "hostSessionSend",
   "host:workspace": "hostWorkspace",
   "host:workspace:remote": "hostWorkspaceRemote",
   "host:worktree": "hostWorktree",
