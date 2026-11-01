@@ -461,12 +461,13 @@ impl Engine for PiFamilyEngine {
             // 命令按序执行:get_state 拿 sessionId(json 模式的 session 头帧
             // 在 rpc 没有等价物)→下发任务;omp 额外先协商 v2 分片。早写无
             // 害:输入循环在 session 就绪后才启动,管道会缓冲这些行。
-            let is_omp_compact =
-                self.id == "omp" && req.native_compact && req.images.is_empty();
-            // OMP 将 /compact 作为本地 RPC 命令处理。用普通 prompt 会得到
-            // agentInvoked:false 和 command_output,但不会发 agent_end,宿主因此
-            // 永远等不到回合终态。原生命令的 response 在压缩完成后才返回。
-            let request = if is_omp_compact {
+            let is_native_compact =
+                matches!(self.id, "omp" | "pi") && req.native_compact && req.images.is_empty();
+            // Pi/OMP 都把宿主的 `/compact` 作为 RPC 命令处理。用普通
+            // prompt 会被 CLI 当作本地 slash command 短路，既不产生模型回合
+            // 也不产生宿主可结算的终态。用户自定义同名目录命令没有
+            // `native_compact` 标记，仍然走普通 prompt。
+            let request = if is_native_compact {
                 serde_json::json!({ "id": "ccgui-compact", "type": "compact" })
             } else {
                 let mut prompt = serde_json::json!({
@@ -561,19 +562,19 @@ impl Engine for PiFamilyEngine {
 }
 
 fn parse_pi_family_line_for_engine(id: &str, line: &str, out: &mut Vec<EngineEvent>) {
-    // Avoid a second JSON parse for normal OMP stream frames; only compact
-    // responses need the OMP-specific terminal mapping below.
-    if id == "omp"
+    // Avoid a second JSON parse for normal Pi-family frames; only compact
+    // responses need the native terminal mapping below.
+    if matches!(id, "omp" | "pi")
         && line.contains("\"command\"")
         && line.contains("\"compact\"")
-        && parse_omp_compact_response(line, out)
+        && parse_native_compact_response(id, line, out)
     {
         return;
     }
     parse_pi_family_line(line, out);
 }
 
-fn parse_omp_compact_response(line: &str, out: &mut Vec<EngineEvent>) -> bool {
+fn parse_native_compact_response(engine_id: &str, line: &str, out: &mut Vec<EngineEvent>) -> bool {
     let Ok(value) = serde_json::from_str::<Value>(line) else {
         return false;
     };
@@ -593,7 +594,7 @@ fn parse_omp_compact_response(line: &str, out: &mut Vec<EngineEvent>) -> bool {
             .get("error")
             .and_then(Value::as_str)
             .unwrap_or("未知错误");
-        out.push(EngineEvent::Error(format!("omp 压缩失败:{error}")));
+        out.push(EngineEvent::Error(format!("{engine_id} 压缩失败:{error}")));
     }
     true
 }
@@ -1166,8 +1167,8 @@ mod tests {
         req.prompt = "/compact".to_string();
         req.native_compact = true;
         assert_eq!(rpc_command_types(&omp(), &req), vec!["compact"]);
-        // pi 没有这条命令，保持普通 prompt。
-        assert_eq!(rpc_command_types(&pi(), &req), vec!["prompt"]);
+        // Pi and OMP expose the same native compact RPC.
+        assert_eq!(rpc_command_types(&pi(), &req), vec!["compact"]);
 
         // 用户自定义的同名目录命令由 CLI 自己展开：文本一样，但没有标记，
         // 绝不能被改写成压缩命令（否则该命令永远执行不到）。
@@ -1501,11 +1502,23 @@ mod tests {
         );
         assert!(matches!(&out[..], [EngineEvent::Error(_)]), "got {out:?}");
 
-        // The shared Pi-family parser must not make Pi treat an OMP-only
-        // response as a terminal event.
+        // Cancellation is a terminal failure for the compact attempt and
+        // must clear the UI's in-progress state without looking successful.
+        let mut out = Vec::new();
+        pi().parse_line(
+            &serde_json::json!({
+                "id": "ccgui-compact", "type": "response", "command": "compact",
+                "success": false, "error": "cancelled",
+            })
+            .to_string(),
+            &mut out,
+        );
+        assert!(matches!(&out[..], [EngineEvent::Error(message)] if message.contains("cancelled")));
+
+        // The shared Pi-family parser handles the response for both engines.
         let mut out = Vec::new();
         pi().parse_line(&compact_success, &mut out);
-        assert!(out.is_empty(), "got {out:?}");
+        assert!(matches!(&out[..], [EngineEvent::Done { .. }]), "got {out:?}");
 
         // Unrelated command failures remain non-terminal warnings.
         let mut out = Vec::new();
