@@ -1,0 +1,67 @@
+name: Build macOS artifact (unsigned)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch, tag, or commit to build"
+        required: false
+        default: main
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-macos-fast-${{ inputs.ref || 'main' }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: macOS Intel app
+    runs-on: macos-15-intel
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || 'main' }}
+          fetch-depth: 1
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: './src-tauri -> target'
+          cache-bin: false
+          shared-key: v1-macos-fast-x86_64-rust
+          cache-on-failure: true
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile --ignore-scripts
+
+      - name: Build unsigned app
+        env:
+          NODE_OPTIONS: "--max-old-space-size=8192"
+        run: pnpm exec tauri build --bundles app --no-sign
+
+      - name: Upload app artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ccgui-macos-x86_64-unsigned
+          path: src-tauri/target/release/bundle/macos/CC GUI.app
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
