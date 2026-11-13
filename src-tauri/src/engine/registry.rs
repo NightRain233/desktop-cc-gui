@@ -51,9 +51,10 @@ pub struct ChildEntry {
     pub plans: Arc<Mutex<HashMap<String, Value>>>,
 }
 
-/// Idle runs kept warm at once: each parked claude process holds a few
-/// hundred MB, so parking one more reclaims the longest-parked.
-pub(crate) const MAX_IDLE_RUNS: usize = 4;
+/// Keep one idle Claude run warm for the common single-user workflow. Each
+/// parked process holds a few hundred MB; additional warm processes are more
+/// costly than the cold-start they avoid on a personal machine.
+pub(crate) const MAX_IDLE_RUNS: usize = 1;
 /// An idle run nobody sent into for this long is reclaimed.
 pub(crate) const IDLE_RUN_TTL: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 
