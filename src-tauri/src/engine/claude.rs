@@ -244,6 +244,7 @@ impl Engine for ClaudeEngine {
                         message: format_api_retry(&value),
                     });
                 } else if subtype == Some("init") {
+                    out.push(EngineEvent::TurnStarted);
                     // `system/init` is the only place the CLI reports which MCP
                     // servers it actually loaded. Capture it as an engine event
                     // (session-scoped snapshot for the MCP settings page); its

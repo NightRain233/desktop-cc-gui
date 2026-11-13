@@ -291,10 +291,10 @@ pub(crate) struct TurnCore {
     /// 审批事实源:计划事件到达即落盘(engine/plan_review.rs)。驱动内部与
     /// 测试构造点没有 db 句柄时为 None——那些路径不产生计划事件。
     pub(crate) db: Option<Arc<crate::db::Db>>,
-    /// Launch settings of a chat run eligible for background-follow-up
-    /// parking (`Some` only for chat-sink claude runs). `None` — plugin and
-    /// mission turns, other engines, tests — keeps the old settle behavior:
-    /// stdin closes at `done` and the process exits instead of idling.
+    /// Launch settings of a chat run eligible for parking after `done`
+    /// (`Some` only for chat-sink claude runs). `None` — plugin and mission
+    /// turns, other engines, tests — keeps the old settle behavior: stdin
+    /// closes at `done` and the process exits instead of idling.
     pub(crate) followup: Option<FollowupPrefs>,
 }
 /// 停住的计划审批随运行消亡:原生请求不再有效,记录过期并推送
@@ -352,12 +352,17 @@ impl TurnCore {
         if (state.saw_done || state.saw_error) && !matches!(event, EngineEvent::SessionId(_)) {
             return;
         }
-        // The CLI's follow-up turn (after a background task) streams under a
-        // run the UI already settled: tell it to reopen the run first.
+        // The parked run's next turn (the CLI's follow-up after a background
+        // task, or a message sent into it) streams under a run the UI already
+        // settled: tell it to reopen the run first — at the turn's start when
+        // the CLI announces it, else at its first content.
         if state.awaiting_followup
             && matches!(
                 event,
-                EngineEvent::Delta(_) | EngineEvent::Thinking(_) | EngineEvent::Message { .. }
+                EngineEvent::TurnStarted
+                    | EngineEvent::Delta(_)
+                    | EngineEvent::Thinking(_)
+                    | EngineEvent::Message { .. }
             )
         {
             state.awaiting_followup = false;
@@ -775,26 +780,35 @@ impl TurnCore {
             EngineEvent::BackgroundTasks { pending } => {
                 state.pending_background_tasks = pending;
             }
+            EngineEvent::TurnStarted => {}
             EngineEvent::Done { session_id, usage } => {
                 let gen_ms = state.take_gen_ms();
                 if let Some(id) = session_id {
                     self.adopt_session_id(state, &id, false);
                 }
-                let park_prefs = if state.pending_background_tasks > 0 {
-                    self.followup.clone()
-                } else {
-                    None
-                };
+                // Nothing pending: park anyway so the next message on this
+                // session goes into the live process instead of paying the
+                // CLI's cold start — only when a session id can route it.
+                let idle = state.pending_background_tasks == 0;
+                let park_prefs = self
+                    .followup
+                    .clone()
+                    .filter(|_| !idle || state.native_session_id.is_some());
                 if let Some(prefs) = park_prefs {
-                    // A background task is still running: the CLI opens a
-                    // follow-up turn by itself when it finishes. Settle the
-                    // visible turn now so the UI is usable, but keep stdin and
-                    // the reader alive (saw_done stays false) so that turn is
-                    // still received; `turn_resumed` reopens the run for it.
+                    // Settle the visible turn now so the UI is usable, but
+                    // keep stdin and the reader alive (saw_done stays false):
+                    // a background task's self-started follow-up turn, or the
+                    // user's next message, still streams under this run, and
+                    // `turn_resumed` reopens it.
                     state.awaiting_followup = true;
-                    if let Some(id) = state.native_session_id.as_deref() {
-                        self.registry
-                            .set_awaiting_followup(id, &self.run_id, prefs);
+                    if let Some(id) = state.native_session_id.clone() {
+                        let ticket =
+                            self.registry
+                                .set_awaiting_followup(&id, &self.run_id, prefs, idle);
+                        self.registry.reclaim_runs(ticket.evicted);
+                        if idle {
+                            self.registry.schedule_idle_reclaim(id, ticket.token);
+                        }
                     }
                 } else {
                     state.saw_done = true;
@@ -1214,7 +1228,10 @@ pub(crate) async fn run_reader(stdout: ChildStdout, ctx: RunContext) {
         .map(|g| redact_secrets(g.trim()))
         .unwrap_or_default();
     let failed = status.map(|s| !s.success()).unwrap_or(true);
-    if failed && !state.saw_error && !stderr_tail.is_empty() {
+    // A parked run that got killed was reclaimed (idle TTL/capacity, or a
+    // send that could not reuse it): its turn already settled cleanly.
+    let reclaimed = state.awaiting_followup && ctx.killed.load(std::sync::atomic::Ordering::SeqCst);
+    if failed && !state.saw_error && !stderr_tail.is_empty() && !reclaimed {
         state.push(
             &ctx.core.sink,
             &ctx.core.run_id,

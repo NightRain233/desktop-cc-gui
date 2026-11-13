@@ -167,6 +167,10 @@ pub enum EngineEvent {
     /// still has running. While non-zero, a `Done` is deferred: the CLI starts
     /// a follow-up turn on its own when the task finishes. Not streamed.
     BackgroundTasks { pending: usize },
+    /// The CLI began a turn (claude `system/init`, emitted at the start of
+    /// every turn). Reopens a parked run before its first content, so retry
+    /// and error reports of the resumed turn reach the UI. Not streamed.
+    TurnStarted,
 }
 /// One todo entry carried to the frontend.
 #[derive(Debug, Clone, Serialize)]

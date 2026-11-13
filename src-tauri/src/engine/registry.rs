@@ -51,9 +51,16 @@ pub struct ChildEntry {
     pub plans: Arc<Mutex<HashMap<String, Value>>>,
 }
 
-/// Launch-time settings of a run parked for a background follow-up turn.
-/// A live process cannot accept new launch flags, so a send whose settings
-/// differ must not be written into it — it falls back to a fresh process.
+/// Idle runs kept warm at once: each parked claude process holds a few
+/// hundred MB, so parking one more reclaims the longest-parked.
+pub(crate) const MAX_IDLE_RUNS: usize = 4;
+/// An idle run nobody sent into for this long is reclaimed.
+pub(crate) const IDLE_RUN_TTL: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// Launch-time settings of a parked run, taken from the send's raw request
+/// on both sides of the comparison. A live process cannot accept new launch
+/// flags, so a send whose settings differ must not be written into it — it
+/// falls back to a fresh process.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct FollowupPrefs {
     pub model: Option<String>,
@@ -62,12 +69,31 @@ pub(crate) struct FollowupPrefs {
     pub provider_id: Option<String>,
     pub memory_bot: Option<String>,
     pub allowed_tools: Option<Vec<String>>,
+    pub computer_use: bool,
+    /// Granted directories ride the launch as `--add-dir`.
+    pub additional_dirs: Vec<String>,
+    /// Hash of what the raw request resolves against at launch (channel
+    /// config, default model/effort): an edited channel behind an unchanged
+    /// provider id must not keep its stale env.
+    pub launch_fingerprint: u64,
 }
-/// A settled run kept alive for the CLI's self-started follow-up turn.
+/// A settled run kept alive for its next turn: the CLI's self-started
+/// follow-up after a background task, or (`idle`) the user's next message.
 #[derive(Debug, Clone)]
 pub(crate) struct AwaitingFollowup {
     pub run_id: String,
     pub prefs: FollowupPrefs,
+    /// Nothing pending: parked only so the next send skips the CLI's cold
+    /// start, hence reclaimable (TTL, capacity) and not a busy run.
+    pub idle: bool,
+    /// Park order, and this park's identity for its TTL timer: a run that
+    /// resumed and parked again must not be reclaimed by the older timer.
+    pub token: u64,
+}
+/// What parking a run produced: its token, and idle runs it displaced.
+pub(crate) struct ParkTicket {
+    pub token: u64,
+    pub evicted: Vec<String>,
 }
 
 #[derive(Default)]
@@ -173,6 +199,28 @@ impl ProcessRegistry {
         }
     }
 
+    /// In-flight runs minus idle parks: a run kept warm for the next message
+    /// is not work a quit would interrupt.
+    pub fn busy_run_count(&self) -> usize {
+        let idle: std::collections::HashSet<String> = match self.2.lock() {
+            Ok(map) => map
+                .values()
+                .filter(|waiting| waiting.idle)
+                .map(|waiting| waiting.run_id.clone())
+                .collect(),
+            Err(_) => Default::default(),
+        };
+        let map = match self.0.lock() {
+            Ok(map) => map,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        map.values()
+            .map(|entry| entry.run_id.as_str())
+            .filter(|run| !idle.contains(*run))
+            .collect::<std::collections::HashSet<_>>()
+            .len()
+    }
+
     /// Write one NDJSON control line to a live run's interactive stdin.
     /// Err when the run is unknown, its stdin is already closed, or the
     /// pipe refuses the write — a swallowed failure would leave the CLI
@@ -264,21 +312,90 @@ impl ProcessRegistry {
     /// Record that `run_id` settled its turn but still waits for the CLI's
     /// follow-up turn on `session_id`, snapshotting its launch settings so a
     /// later send can tell whether the live process still matches them.
+    /// A replacement owner, or an idle park beyond [`MAX_IDLE_RUNS`], is
+    /// returned for reclamation; the caller kills those runs.
     pub(crate) fn set_awaiting_followup(
         &self,
         session_id: &str,
         run_id: &str,
         prefs: FollowupPrefs,
-    ) {
+        idle: bool,
+    ) -> ParkTicket {
+        static NEXT_TOKEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let token = NEXT_TOKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut evicted = Vec::new();
         if let Ok(mut map) = self.2.lock() {
-            map.insert(
+            let previous = map.insert(
                 session_id.to_string(),
                 AwaitingFollowup {
                     run_id: run_id.to_string(),
                     prefs,
+                    idle,
+                    token,
                 },
             );
+            // A session can only have one live owner. If a replacement wins
+            // a race with an older run that was still settling, reclaim the
+            // old owner instead of leaving it alive without a routing ticket.
+            if let Some(previous) = previous.filter(|waiting| waiting.run_id != run_id) {
+                evicted.push(previous.run_id);
+            }
+            let mut idle_parks: Vec<(u64, String)> = map
+                .iter()
+                .filter(|(_, waiting)| waiting.idle)
+                .map(|(session, waiting)| (waiting.token, session.clone()))
+                .collect();
+            idle_parks.sort();
+            let excess = idle_parks.len().saturating_sub(MAX_IDLE_RUNS);
+            for (_, session) in idle_parks.into_iter().take(excess) {
+                if let Some(waiting) = map.remove(&session) {
+                    evicted.push(waiting.run_id);
+                }
+            }
         }
+        ParkTicket { token, evicted }
+    }
+
+    /// Take the idle run parked on `session_id` only if it is still the park
+    /// identified by `token` (TTL expiry).
+    pub(crate) fn take_idle_if_token(&self, session_id: &str, token: u64) -> Option<String> {
+        let mut map = self.2.lock().ok()?;
+        let current = map
+            .get(session_id)
+            .is_some_and(|waiting| waiting.idle && waiting.token == token);
+        current
+            .then(|| map.remove(session_id))
+            .flatten()
+            .map(|waiting| waiting.run_id)
+    }
+
+    /// Kill reclaimed idle runs off the async thread. Each parked run already
+    /// settled its turn, so the reader emits nothing user-visible for it.
+    pub(crate) fn reclaim_runs(self: &Arc<Self>, runs: Vec<String>) {
+        if runs.is_empty() {
+            return;
+        }
+        let registry = Arc::clone(self);
+        tokio::spawn(async move {
+            let _ = tokio::task::spawn_blocking(move || {
+                for run in runs {
+                    registry.kill(&run);
+                }
+            })
+            .await;
+        });
+    }
+
+    /// Reclaim the idle park `token` on `session_id` after [`IDLE_RUN_TTL`],
+    /// unless a send took it (or it parked again) in the meantime.
+    pub(crate) fn schedule_idle_reclaim(self: &Arc<Self>, session_id: String, token: u64) {
+        let registry = Arc::clone(self);
+        tokio::spawn(async move {
+            tokio::time::sleep(IDLE_RUN_TTL).await;
+            if let Some(run) = registry.take_idle_if_token(&session_id, token) {
+                registry.reclaim_runs(vec![run]);
+            }
+        });
     }
 
     /// The run no longer waits (follow-up arrived, run settled or exited).
@@ -601,16 +718,8 @@ mod registry_tests {
     #[test]
     fn awaiting_followup_is_taken_once_per_session_and_cleared_by_run() {
         let registry = ProcessRegistry::default();
-        let prefs = || FollowupPrefs {
-            model: None,
-            effort: None,
-            permission: None,
-            provider_id: None,
-            memory_bot: None,
-            allowed_tools: None,
-        };
-        registry.set_awaiting_followup("s-1", "run-1", prefs());
-        registry.set_awaiting_followup("s-2", "run-2", prefs());
+        registry.set_awaiting_followup("s-1", "run-1", test_prefs(), false);
+        registry.set_awaiting_followup("s-2", "run-2", test_prefs(), false);
 
         assert_eq!(
             registry.take_awaiting_followup("s-1").map(|a| a.run_id).as_deref(),
@@ -621,6 +730,84 @@ mod registry_tests {
 
         registry.clear_awaiting_followup("run-2");
         assert!(registry.take_awaiting_followup("s-2").is_none());
+    }
+
+    fn test_prefs() -> FollowupPrefs {
+        FollowupPrefs {
+            model: None,
+            effort: None,
+            permission: None,
+            provider_id: None,
+            memory_bot: None,
+            allowed_tools: None,
+            computer_use: false,
+            additional_dirs: Vec::new(),
+            launch_fingerprint: 0,
+        }
+    }
+
+    /// Idle parks are capped: one past the cap displaces the longest-parked
+    /// idle run, never a run waiting on a background task.
+    #[test]
+    fn idle_park_beyond_capacity_evicts_the_oldest_idle_run() {
+        let registry = ProcessRegistry::default();
+        registry.set_awaiting_followup("bg", "bg-run", test_prefs(), false);
+        for i in 0..MAX_IDLE_RUNS {
+            let ticket =
+                registry.set_awaiting_followup(&format!("s-{i}"), &format!("run-{i}"), test_prefs(), true);
+            assert!(ticket.evicted.is_empty());
+        }
+        let ticket = registry.set_awaiting_followup("s-new", "run-new", test_prefs(), true);
+        assert_eq!(ticket.evicted, ["run-0"]);
+        assert!(registry.take_awaiting_followup("s-0").is_none());
+        assert!(registry.take_awaiting_followup("bg").is_some());
+        assert!(registry.take_awaiting_followup("s-new").is_some());
+    }
+
+    /// A late settle from a replaced owner must not strand the old process
+    /// under a session whose routing ticket now belongs to the new run.
+    #[test]
+    fn replacing_a_session_owner_returns_the_old_run_for_reclamation() {
+        let registry = ProcessRegistry::default();
+        registry.set_awaiting_followup("s-1", "old-run", test_prefs(), true);
+        let ticket = registry.set_awaiting_followup("s-1", "new-run", test_prefs(), true);
+        assert_eq!(ticket.evicted, ["old-run"]);
+        assert_eq!(
+            registry.take_awaiting_followup("s-1").map(|waiting| waiting.run_id),
+            Some("new-run".to_string())
+        );
+    }
+
+    /// The TTL only reclaims the park it was scheduled for: a run that a send
+    /// resumed and that parked again carries a new token.
+    #[test]
+    fn idle_ttl_reclaims_only_its_own_park() {
+        let registry = ProcessRegistry::default();
+        let first = registry.set_awaiting_followup("s-1", "run-1", test_prefs(), true);
+        let second = registry.set_awaiting_followup("s-1", "run-1", test_prefs(), true);
+        assert_eq!(registry.take_idle_if_token("s-1", first.token), None);
+        assert_eq!(
+            registry.take_idle_if_token("s-1", second.token).as_deref(),
+            Some("run-1")
+        );
+        assert_eq!(registry.take_idle_if_token("s-1", second.token), None);
+
+        let bg = registry.set_awaiting_followup("s-2", "run-2", test_prefs(), false);
+        assert_eq!(registry.take_idle_if_token("s-2", bg.token), None, "background parks have no TTL");
+    }
+
+    /// Quitting must not ask about runs merely kept warm; a run waiting on a
+    /// background task is still busy.
+    #[test]
+    fn idle_parks_are_not_busy_runs() {
+        let registry = ProcessRegistry::default();
+        registry.insert("run-1".to_string(), stub_entry("run-1", 101));
+        registry.insert_alias("s-1".to_string(), stub_entry("run-1", 101));
+        registry.insert("run-2".to_string(), stub_entry("run-2", 102));
+        registry.set_awaiting_followup("s-1", "run-1", test_prefs(), true);
+        registry.set_awaiting_followup("s-2", "run-2", test_prefs(), false);
+        assert_eq!(registry.active_run_count(), 2);
+        assert_eq!(registry.busy_run_count(), 1);
     }
 
     /// rekey must COPY (not move) so both the session-id and run-id keys

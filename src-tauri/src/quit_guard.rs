@@ -99,7 +99,7 @@ mod macos {
         };
         let active = app
             .try_state::<AppState>()
-            .map(|state| state.processes.active_run_count())
+            .map(|state| state.processes.busy_run_count())
             .unwrap_or(0);
         let reply = should_terminate_reply(active);
         if reply == NS_TERMINATE_CANCEL {

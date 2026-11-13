@@ -515,6 +515,57 @@ struct Launch {
     built: BuiltCommand,
     engine_impl: Box<dyn Engine>,
 }
+/// Granted directories as they land on the launch: cap defensively, the
+/// list lands on a command line and a hand-edited db should not produce an
+/// argv bomb.
+fn launch_dirs(dirs: Vec<String>) -> Vec<String> {
+    dirs.into_iter()
+        .map(|d| d.trim().to_string())
+        .filter(|d| !d.is_empty() && Path::new(d).is_absolute())
+        .take(32)
+        .collect()
+}
+
+/// Launch settings a parked claude run is matched on, computed from the raw
+/// request — the same way when parking and when a later send compares — so
+/// a request that resolves identically reuses the process.
+#[allow(clippy::too_many_arguments)]
+fn followup_prefs(
+    state: &crate::AppState,
+    model: Option<&String>,
+    effort: Option<&String>,
+    permission: Option<&String>,
+    provider_id: Option<&String>,
+    computer_use: Option<bool>,
+    memory_bot: Option<&String>,
+    allowed_tools: Option<&Vec<String>>,
+) -> registry::FollowupPrefs {
+    use std::hash::{Hash, Hasher};
+    let blank = |v: Option<&String>| v.filter(|s| !s.trim().is_empty()).cloned();
+    let provider_id = blank(provider_id);
+    // Hashed, never kept: the channel config carries credentials.
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    crate::config::resolve_provider("claude", provider_id.as_deref())
+        .ok()
+        .flatten()
+        .map(|provider| provider.to_string())
+        .hash(&mut hasher);
+    let settings = crate::settings::read_settings().unwrap_or_default();
+    settings.default_models.get("claude").hash(&mut hasher);
+    settings.default_efforts.get("claude").hash(&mut hasher);
+    registry::FollowupPrefs {
+        model: blank(model),
+        effort: blank(effort),
+        permission: blank(permission),
+        provider_id,
+        memory_bot: blank(memory_bot),
+        allowed_tools: allowed_tools.cloned(),
+        computer_use: computer_use == Some(true),
+        additional_dirs: launch_dirs(state.db.granted_roots().unwrap_or_default()),
+        launch_fingerprint: hasher.finish(),
+    }
+}
+
 fn prepare_launch(
     engine: &str,
     workspace_path: &str,
@@ -608,12 +659,7 @@ fn prepare_launch(
         permission: permission.filter(|p| !p.trim().is_empty()),
         // Cap defensively: the list lands on a command line, and a
         // hand-edited db should not produce an argv bomb.
-        additional_dirs: additional_dirs
-            .into_iter()
-            .map(|d| d.trim().to_string())
-            .filter(|d| !d.is_empty() && Path::new(d).is_absolute())
-            .take(32)
-            .collect(),
+        additional_dirs: launch_dirs(additional_dirs),
         provider_id,
         // Only honored by engines that can actually mount the driver.
         computer_use: computer_use.filter(|on| *on && engine_impl.supports_computer_use()),
@@ -916,14 +962,16 @@ async fn send_message_inner_with_sink(
         let workspace = PathBuf::from(&workspace_path);
         let images = image_paths.clone().unwrap_or_default();
         let effective = effective_prompt(&prompt, prompt_contributions.clone());
-        let prefs = registry::FollowupPrefs {
-            model: model.clone(),
-            effort: effort.clone(),
-            permission: permission.clone(),
-            provider_id: provider_id.clone(),
-            memory_bot: memory_bot.clone(),
-            allowed_tools: allowed_tools.clone(),
-        };
+        let prefs = followup_prefs(
+            state,
+            model.as_ref(),
+            effort.as_ref(),
+            permission.as_ref(),
+            provider_id.as_ref(),
+            computer_use,
+            memory_bot.as_ref(),
+            allowed_tools.as_ref(),
+        );
         if let Some(live_run) = deliver_to_idle_followup(
             &state.processes,
             session_id.as_deref(),
@@ -936,6 +984,19 @@ async fn send_message_inner_with_sink(
                 run_id: live_run,
                 session_id,
             });
+        }
+    }
+    // Any other launch on a session with a parked process (plugin/mission
+    // sends, computer use) resumes it fresh: retire the parked one first so
+    // two CLIs never write the same session.
+    if engine == "claude" {
+        if let Some(parked) = session_id
+            .as_deref()
+            .and_then(|id| state.processes.take_awaiting_followup(id))
+        {
+            let registry = Arc::clone(&state.processes);
+            let _ = tauri::async_runtime::spawn_blocking(move || registry.kill(&parked.run_id))
+                .await;
         }
     }
     let run_id = run_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
@@ -1036,7 +1097,17 @@ async fn deliver_to_idle_followup(
         kill_idle(registry, &idle_run).await;
         return Ok(None);
     }
-    let line = message()?;
+    let line = match message() {
+        Ok(line) => line,
+        Err(error) => {
+            // The parked entry was taken before building the control frame.
+            // If attachment encoding or another validation fails, reclaim the
+            // process as well; otherwise the session loses its routing ticket
+            // and a later send can launch a second CLI for the same session.
+            kill_idle(registry, &idle_run).await;
+            return Err(error);
+        }
+    };
     if registry.write_line(&idle_run, line).await.is_ok() {
         return Ok(Some(idle_run));
     }
@@ -1071,6 +1142,20 @@ async fn send_reserved(
 ) -> Result<SendResult, String> {
     // WSL 远程工作区:引擎进程经 ssh 在发行版内执行(见 wsl_transport)。
     let wsl_tp = wsl_transport::transport_for_workspace(&state.db, &workspace_path);
+    // Only chat claude runs park after `done`; snapshot the raw request so a
+    // later send can detect drift.
+    let followup = (engine == "claude" && Arc::ptr_eq(&sink, &state.sink)).then(|| {
+        followup_prefs(
+            state,
+            model.as_ref(),
+            effort.as_ref(),
+            permission.as_ref(),
+            provider_id.as_ref(),
+            computer_use,
+            memory_bot.as_ref(),
+            allowed_tools.as_ref(),
+        )
+    });
     let mut launch = prepare_launch(
         &engine,
         &workspace_path,
@@ -1288,18 +1373,7 @@ async fn send_reserved(
             engine_id: engine.clone(),
             run_id: run_id.clone(),
             db: Some(Arc::clone(&state.db)),
-            // Only chat claude runs park for a background follow-up turn;
-            // snapshot the launch settings so a later send can detect drift.
-            followup: (engine == "claude" && Arc::ptr_eq(&sink, &state.sink)).then(|| {
-                registry::FollowupPrefs {
-                    model: launch.req.model.clone(),
-                    effort: launch.req.effort.clone(),
-                    permission: launch.req.permission.clone(),
-                    provider_id: launch.req.provider_id.clone(),
-                    memory_bot: launch.req.memory_bot.clone(),
-                    allowed_tools: launch.req.allowed_tools.clone(),
-                }
-            }),
+            followup,
         },
         engine_impl: launch.engine_impl,
         pid,
@@ -2767,12 +2841,15 @@ mod retry_lifecycle_tests {
             provider_id: None,
             memory_bot: None,
             allowed_tools: None,
+            computer_use: false,
+            additional_dirs: Vec::new(),
+            launch_fingerprint: 0,
         }
     }
 
     /// Done with a background task pending settles the turn but parks the run
-    /// as idle-for-follow-up; the follow-up's first content reopens it, and a
-    /// done with nothing pending closes it for good.
+    /// for the follow-up; the follow-up's first content reopens it, and a done
+    /// with nothing pending parks it as idle (reusable, reclaimable).
     #[tokio::test]
     async fn done_with_pending_background_task_parks_and_resumes_the_run() {
         let emitter = Arc::new(CollectingEmitter::default());
@@ -2798,14 +2875,16 @@ mod retry_lifecycle_tests {
             registry.take_awaiting_followup("s-1").map(|a| a.run_id).as_deref(),
             Some("bg-run")
         );
-        registry.set_awaiting_followup("s-1", "bg-run", test_followup_prefs());
+        registry.set_awaiting_followup("s-1", "bg-run", test_followup_prefs(), false);
 
         core.dispatch_event(&mut state, EngineEvent::BackgroundTasks { pending: 0 });
         core.dispatch_event(&mut state, EngineEvent::Delta("later".to_string()));
         assert!(registry.take_awaiting_followup("s-1").is_none(), "resumed run is no longer idle");
 
         core.dispatch_event(&mut state, done());
-        assert!(state.saw_done);
+        assert!(!state.saw_done, "an idle chat run stays parked for the next send");
+        let parked = registry.take_awaiting_followup("s-1").expect("idle park");
+        assert!(parked.idle);
         core.sink.flush();
         let kinds: Vec<_> = emitter
             .0
@@ -2815,6 +2894,86 @@ mod retry_lifecycle_tests {
             .map(|event| event["kind"].as_str().unwrap().to_string())
             .collect();
         assert_eq!(kinds, ["done", "turn_resumed", "delta", "done"]);
+    }
+
+    /// A message sent into a parked run reopens it when the CLI announces the
+    /// turn, before any content: an API retry (or error) ahead of the first
+    /// token must reach the UI instead of landing on a settled run.
+    #[tokio::test]
+    async fn parked_run_reopens_at_turn_start_before_any_content() {
+        let emitter = Arc::new(CollectingEmitter::default());
+        let registry = Arc::new(ProcessRegistry::default());
+        let core = TurnCore {
+            sink: event_sink::EventSink::new(emitter.clone()),
+            registry: Arc::clone(&registry),
+            engine_id: "claude".to_string(),
+            run_id: "warm-run".to_string(),
+            db: None,
+            followup: Some(test_followup_prefs()),
+        };
+        let mut state = TurnState::new(Some("s-1".to_string()));
+        core.dispatch_event(
+            &mut state,
+            EngineEvent::Done {
+                session_id: None,
+                usage: None,
+            },
+        );
+        core.dispatch_event(&mut state, EngineEvent::TurnStarted);
+        core.dispatch_event(
+            &mut state,
+            EngineEvent::Retry {
+                attempt: 1,
+                max: 10,
+                message: "overloaded".to_string(),
+            },
+        );
+        core.dispatch_event(&mut state, EngineEvent::Delta("hi".to_string()));
+        core.sink.flush();
+        let kinds: Vec<_> = emitter
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|event| event["kind"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(kinds.len(), 4, "{kinds:?}");
+        assert_eq!(&kinds[..2], ["done", "turn_resumed"]);
+        assert_eq!(kinds[3], "delta", "one resume per turn: {kinds:?}");
+    }
+
+    /// A chat turn with nothing pending parks idle so the next message skips
+    /// the cold start; without a session id nothing could route a send to
+    /// it, and runs outside chat (followup None) settle as before.
+    #[tokio::test]
+    async fn done_parks_idle_only_when_a_session_can_route_to_it() {
+        let make_core = |run: &str, followup: Option<registry::FollowupPrefs>, registry: &Arc<ProcessRegistry>| TurnCore {
+            sink: event_sink::EventSink::new(Arc::new(CollectingEmitter::default())),
+            registry: Arc::clone(registry),
+            engine_id: "claude".to_string(),
+            run_id: run.to_string(),
+            db: None,
+            followup,
+        };
+        let done = || EngineEvent::Done {
+            session_id: None,
+            usage: None,
+        };
+        let registry = Arc::new(ProcessRegistry::default());
+
+        let mut state = TurnState::new(Some("s-1".to_string()));
+        make_core("run-1", Some(test_followup_prefs()), &registry).dispatch_event(&mut state, done());
+        assert!(!state.saw_done);
+        assert!(registry.take_awaiting_followup("s-1").is_some_and(|p| p.idle));
+
+        let mut state = TurnState::new(None);
+        make_core("run-2", Some(test_followup_prefs()), &registry).dispatch_event(&mut state, done());
+        assert!(state.saw_done, "no session id: settle and exit");
+
+        let mut state = TurnState::new(Some("s-3".to_string()));
+        make_core("run-3", None, &registry).dispatch_event(&mut state, done());
+        assert!(state.saw_done, "non-chat runs never park");
+        assert!(registry.take_awaiting_followup("s-3").is_none());
     }
 
     #[tokio::test]
@@ -3170,7 +3329,7 @@ mod retry_lifecycle_tests {
                 plans: Arc::new(Mutex::new(HashMap::new())),
             },
         );
-        registry.set_awaiting_followup(session_id, run_id, test_followup_prefs());
+        registry.set_awaiting_followup(session_id, run_id, test_followup_prefs(), true);
         child
     }
 
@@ -3277,6 +3436,34 @@ mod retry_lifecycle_tests {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
         panic!("idle run was not killed after settings drift");
+    }
+
+    /// Building the follow-up frame can fail before anything is written (for
+    /// example, an attached image cannot be read). Taking the park must still
+    /// retire the live process so a later send cannot start a duplicate CLI.
+    #[tokio::test]
+    async fn send_frame_failure_kills_the_taken_idle_process() {
+        let registry = Arc::new(ProcessRegistry::default());
+        let mut child = idle_followup_child(&registry, "idle-run", "s-4").await;
+        let error = deliver_to_idle_followup(
+            &registry,
+            Some("s-4"),
+            &test_followup_prefs(),
+            || Err("image file disappeared".to_string()),
+        )
+        .await
+        .expect_err("the frame-building error must reach the sender");
+        assert_eq!(error, "image file disappeared");
+        assert!(registry.take_awaiting_followup("s-4").is_none());
+        let killed = registry.get("idle-run").unwrap().killed;
+        for _ in 0..100 {
+            if killed.load(std::sync::atomic::Ordering::SeqCst) {
+                let _ = child.kill().await;
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("idle run was not killed after frame construction failed");
     }
 
     /// The first turn settles at its own result even with a task pending, so
