@@ -1,9 +1,7 @@
 name: PR Target Branch Check
 
-# Prevents feature/fix PRs from being merged into main by mistake.
-# Convention: day-to-day PRs target the active development branch
-# (vX.Y.Z). Only release PRs cut by maintainers from a vX.Y.Z branch
-# may target main.
+# Upstream uses a release-branch workflow. This fork keeps a single main
+# development branch, so its own PRs may target main directly.
 
 on:
   pull_request:
@@ -25,6 +23,7 @@ jobs:
 
       - name: Comment on PRs targeting main
         if: >-
+          github.repository != 'NightRain233/desktop-cc-gui' &&
           github.event.pull_request.base.ref == 'main' &&
           github.event.pull_request.draft == false &&
           !(startsWith(github.event.pull_request.head.ref, 'v') &&
@@ -75,6 +74,7 @@ jobs:
 
       - name: Fail PRs targeting main
         if: >-
+          github.repository != 'NightRain233/desktop-cc-gui' &&
           github.event.pull_request.base.ref == 'main' &&
           github.event.pull_request.draft == false &&
           !(startsWith(github.event.pull_request.head.ref, 'v') &&

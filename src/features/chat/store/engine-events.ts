@@ -16,6 +16,7 @@ import {
   applyStreamParts,
   bufferStreamPart,
   drainPending,
+  dropOrphanRun,
   migratePendingStream,
   moveRetryingFlag,
   moveStreamingFlag,
@@ -116,18 +117,19 @@ function rememberRunId(runId: string): void {
  * permanently failing backend must not spin. */
 const FRAME_RECORD_RETRY_MS = 500;
 const FRAME_RECORD_MAX_ATTEMPTS = 5;
+const FRAME_RECORD_BATCH_SIZE = 32;
 
-function recordAcceptedFrame(
+function recordAcceptedFrames(
   engine: string,
   sessionId: string,
-  frame: string,
+  frames: string[],
   workspacePath: string,
   attempt: number,
 ): void {
-  void ipc.recordAcceptedInternalFrame(engine, sessionId, frame, workspacePath).catch(() => {
+  void ipc.recordAcceptedInternalFrames(engine, sessionId, frames, workspacePath).catch(() => {
     if (attempt >= FRAME_RECORD_MAX_ATTEMPTS) return;
     setTimeout(
-      () => recordAcceptedFrame(engine, sessionId, frame, workspacePath, attempt + 1),
+      () => recordAcceptedFrames(engine, sessionId, frames, workspacePath, attempt + 1),
       FRAME_RECORD_RETRY_MS,
     );
   });
@@ -137,8 +139,15 @@ function persistAcceptedFrames(lifecycle: RunLifecycle): void {
   const frames = lifecycle.acceptedFrames;
   const sessionId = lifecycle.sessionId;
   if (!sessionId || !frames || frames.length === 0) return;
-  for (const frame of frames.splice(0)) {
-    recordAcceptedFrame(lifecycle.engine, sessionId, frame, lifecycle.workspace.path, 1);
+  const accepted = frames.splice(0);
+  for (let offset = 0; offset < accepted.length; offset += FRAME_RECORD_BATCH_SIZE) {
+    recordAcceptedFrames(
+      lifecycle.engine,
+      sessionId,
+      accepted.slice(offset, offset + FRAME_RECORD_BATCH_SIZE),
+      lifecycle.workspace.path,
+      1,
+    );
   }
 }
 
@@ -586,6 +595,7 @@ function applyModelDisplay(
   const current = deps.get().bySession[key]?.activeModel ?? "";
   const model =
     current === reported || current.endsWith(`/${reported}`) ? current : reported;
+  updateStreamDisplayModel(key, model);
   updatePendingStreamModel(key, model);
   deps.set((s) => {
     const cur = s.bySession[key];
@@ -615,6 +625,7 @@ function applyEffortDisplay(
   key: string,
   deps: EngineEventDeps,
 ) {
+  updateStreamDisplayEffort(key, reported);
   deps.set((s) => {
     const cur = s.bySession[key];
     if (!cur || cur.activeEffort === reported) return {};
@@ -711,6 +722,50 @@ function onServed(
  *  than reading `bySession` for every streamed token. */
 const retryingKeys = new Set<string>();
 
+/** Values needed by every streamed chunk. Resolve them once per run instead
+ * of reading the store and scanning open tabs for every delta. The cache is
+ * updated when display metadata changes and dropped when the run settles. */
+interface StreamDisplayContext {
+  key: string;
+  model: string | null;
+  effort: string | null;
+}
+
+const streamDisplayContexts = new Map<string, StreamDisplayContext>();
+
+function streamDisplayContext(
+  runId: string,
+  key: string,
+  engine: string,
+  deps: EngineEventDeps,
+): StreamDisplayContext {
+  const cached = streamDisplayContexts.get(runId);
+  if (cached?.key === key) return cached;
+  const context = {
+    key,
+    model: stampedModel(deps, engine, key),
+    effort: stampedEffort(deps, engine, key),
+  };
+  streamDisplayContexts.set(runId, context);
+  return context;
+}
+
+function updateStreamDisplayModel(key: string, model: string) {
+  for (const context of streamDisplayContexts.values()) {
+    if (context.key === key) context.model = model;
+  }
+}
+
+function updateStreamDisplayEffort(key: string, effort: string) {
+  for (const context of streamDisplayContexts.values()) {
+    if (context.key === key) context.effort = effort;
+  }
+}
+
+function dropStreamDisplayContext(runId: string) {
+  streamDisplayContexts.delete(runId);
+}
+
 function onDelta(
   event: ChatEngineEvent,
   key: string,
@@ -722,12 +777,13 @@ function onDelta(
   if (retryingKeys.has(key)) clearRetry(key, deps);
   const text = filterInternalFrameDelta(event.runId, event.data as string);
   if (!text) return;
+  const display = streamDisplayContext(event.runId, key, event.engine, deps);
   bufferStreamPart(
     key,
     "delta",
     text,
-    stampedModel(deps, event.engine, key),
-    stampedEffort(deps, event.engine, key),
+    display.model,
+    display.effort,
   );
   scheduleDeltaFlush(deps.set);
 }
@@ -739,12 +795,13 @@ function onThinking(
 ) {
   // Content resumed: a re-issued request succeeded, so the retry chip goes.
   if (retryingKeys.has(key)) clearRetry(key, deps);
+  const display = streamDisplayContext(event.runId, key, event.engine, deps);
   bufferStreamPart(
     key,
     "thinking",
     event.data as string,
-    stampedModel(deps, event.engine, key),
-    stampedEffort(deps, event.engine, key),
+    display.model,
+    display.effort,
   );
   scheduleDeltaFlush(deps.set);
 }
@@ -928,7 +985,7 @@ function onSession(
       ?.catch(() => {});
   }
 
-  settleOrphanedRuns(deps.set, routeRun(event.runId, newKey));
+  void reapOrphanedRuns(deps.set, routeRun(event.runId, newKey));
   // Unflushed stream chunks sit under the pre-migration key; move them too.
   migratePendingStream(fromKey, newKey);
   // A delta-only engine reports no native id from the send, so a remembered
@@ -1078,6 +1135,38 @@ const turnUsageTotals = new Map<string, ParsedUsage>();
 export function dropRunUsage(runId: string) {
   turnUsageTotals.delete(runId);
   liveLedgerRuns.delete(runId);
+  dropStreamDisplayContext(runId);
+}
+
+/** Settle the stale runs routeRun reported, but only those the host no
+ * longer runs. Silence is not death: a long command or a question left
+ * waiting emits nothing, and settling it would stop the spinner (and fire a
+ * failed afterTurn) under a live turn. A live run is re-stamped, so it is
+ * asked about again only after another silent TTL; a failed check keeps
+ * every candidate routed for the next sweep to retry. */
+export async function reapOrphanedRuns(
+  set: (fn: (s: ChatStore) => Partial<ChatStore>) => void,
+  candidates: Array<[string, string]>,
+) {
+  if (candidates.length === 0) return;
+  let live: string[];
+  try {
+    live = await ipc.liveRuns(candidates.map(([runId]) => runId));
+  } catch (error) {
+    console.warn("Orphan sweep could not check live runs:", errorText(error));
+    return;
+  }
+  const alive = new Set(live);
+  const orphaned: Array<[string, string]> = [];
+  for (const [runId] of candidates) {
+    if (alive.has(runId)) {
+      touchRun(runId);
+      continue;
+    }
+    const key = dropOrphanRun(runId);
+    if (key !== undefined) orphaned.push([runId, key]);
+  }
+  settleOrphanedRuns(set, orphaned);
 }
 
 /** Drop every trace of runs the orphan sweep reaped: their usage maps here
@@ -1745,6 +1834,7 @@ function onDone(event: ChatEngineEvent, key: string, deps: EngineEventDeps) {
   // The row tells the reader what the reply cost: every report of this run
   // summed, which for a multi-request reply is more than its last request.
   turnUsageTotals.delete(event.runId);
+  dropStreamDisplayContext(event.runId);
   const finalUsage = turnTotals
     ? mergeUsage(usageSnapshot(turnTotals), settledUsage)
     : settledUsage;
@@ -1896,7 +1986,7 @@ function adoptObservedRun(
   deps: EngineEventDeps,
 ) {
   if (!runRouting.has(event.runId)) {
-    settleOrphanedRuns(deps.set, routeRun(event.runId, key));
+    void reapOrphanedRuns(deps.set, routeRun(event.runId, key));
   }
   const cur = deps.get().bySession[key];
   if (!cur?.streaming) {
@@ -1982,7 +2072,7 @@ export function handleEngineEvents(
     if (bindUnboundRun(event)) {
       const lifecycle = runLifecycles.get(event.runId);
       if (lifecycle) {
-        settleOrphanedRuns(
+        void reapOrphanedRuns(
           deps.set,
           routeRun(
             event.runId,
