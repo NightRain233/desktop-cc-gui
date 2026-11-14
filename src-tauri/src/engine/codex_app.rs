@@ -1793,7 +1793,7 @@ async fn handshake_and_start(
             .pump(
                 "thread/compact/start",
                 Expect::Reply(&key),
-                Instant::now() + ack_timeout,
+                ack_timeout.map(|limit| Instant::now() + limit),
                 killed,
                 None,
                 &mut |value| route(core, state, view, value),
