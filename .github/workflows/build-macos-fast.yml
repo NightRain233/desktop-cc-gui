@@ -1,4 +1,4 @@
-name: Build macOS artifact (unsigned)
+name: Build macOS artifacts (unsigned)
 
 on:
   workflow_dispatch:
@@ -18,7 +18,7 @@ concurrency:
 
 jobs:
   build:
-    name: macOS Intel app
+    name: macOS Intel app and DMG
     runs-on: macos-15-intel
     timeout-minutes: 45
 
@@ -52,16 +52,25 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile --ignore-scripts
 
-      - name: Build unsigned app
+      - name: Build unsigned app and DMG
         env:
           NODE_OPTIONS: "--max-old-space-size=8192"
-        run: pnpm exec tauri build --bundles app --no-sign
+        run: pnpm exec tauri build --bundles app,dmg --no-sign
 
       - name: Upload app artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ccgui-macos-x86_64-unsigned
+          name: ccgui-macos-x86_64-unsigned-app
           path: src-tauri/target/release/bundle/macos/CC GUI.app
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
+      - name: Upload DMG artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ccgui-macos-x86_64-unsigned-dmg
+          path: src-tauri/target/release/bundle/dmg/*.dmg
           if-no-files-found: error
           compression-level: 0
           retention-days: 14
