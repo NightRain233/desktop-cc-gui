@@ -9,13 +9,13 @@ describe("describePermission", () => {
       "plugins.hub.permissions.composerDraft",
     );
     expect(describePermission("host:session").key).toBe("plugins.hub.permissions.hostSession");
-    expect(describePermission("host:session:send").key).toBe("plugins.hub.permissions.hostSessionSend");
     expect(describePermission("network:none").key).toBe("plugins.hub.permissions.networkNone");
   });
 
   it("names ui:* capabilities and falls back for unknown ui ids", () => {
     expect(describePermission("ui:status-bar").key).toBe("plugins.hub.permissions.uiStatusBar");
     expect(describePermission("ui:center-tab").key).toBe("plugins.hub.permissions.uiCenterTab");
+    expect(describePermission("ui:file-link-menu").key).toBe("plugins.hub.permissions.uiFileLinkMenu");
     expect(describePermission("ui:future-thing").key).toBe("plugins.hub.permissions.ui");
   });
 

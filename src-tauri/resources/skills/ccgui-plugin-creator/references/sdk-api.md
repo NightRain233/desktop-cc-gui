@@ -1,7 +1,7 @@
 <!-- 由 src/features/plugins/skill/creator-skill-docs.ts 从源码生成，请勿手改。 -->
 <!-- 重新生成：pnpm plugin-skill:docs（测试 creator-skill-docs.test.ts 会断言本文件与源码一致）。 -->
 
-# CC GUI 插件 SDK 参考（SDK 0.3.23）
+# CC GUI 插件 SDK 参考（SDK 0.3.26）
 
 本文件由脚本从 `packages/plugin-sdk`（公共契约）与宿主运行时（权限门禁）派生，属于 `ccgui-plugin-creator` skill。
 字段、方法、权限以本文件为准：**文中没有的 API 一律视为不存在**，不要凭记忆猜测方法名或权限名。
@@ -72,6 +72,7 @@ export default function activate(ctx: PluginContext): void | (() => void) {
 | `ctx.ui.registerComposerStatusItem` | `ui:composer-status` | Composer status-row chip (permission `ui:composer-status`, 0.3.9): renders in the composer's status row (branch/context meter row), left group after the branch switcher. |
 | `ctx.ui.registerOverlay` | `ui:overlay` | Persistent viewport mount; requires ui:overlay. The plugin controls placement and opts interactive children into pointer-events: auto. |
 | `ctx.ui.registerCommand` | `ui:command` | Command palette entry (plan §4.2 #9). |
+| `ctx.ui.registerFileLinkMenuItem` | `ui:file-link-menu` | Chat file-link actions before the external editor (0.3.23). Permission: ui:file-link-menu. run receives a non-null resolvedPath for the clicked link, never the currently active editor's file. label/visible run on every menu open and see the clicked path. |
 | `ctx.ui.registerSessionMenuItem` | `ui:session-menu` | Sidebar session right-click menu row (permission `ui:session-menu`, 0.3.5 起)。`run` 收到打开菜单的会话 `{ engine, sessionId }`。 |
 | `ctx.ui.openSettings` | `ui:settings-section` | 跳转到本插件的设置页（权限 `ui:settings-section`，0.3.6 起）。 `key` 对应 registerSettingsSection 的子 key，省略时打开主 section； 供状态栏 chip、面板按钮等做深链入口。 |
 | `ctx.ui.registerMarkdownRenderer` | `ui:markdown` | Markdown pipeline additions, merged over host defaults (plan §4.2 #5). |
@@ -97,9 +98,8 @@ export default function activate(ctx: PluginContext): void | (() => void) {
 | `ctx.sessions.selectSession` | `host:session` | — |
 | `ctx.sessions.refresh` | `host:session` | 请求宿主立即刷新会话目录（侧栏/标签页），0.3.7 起。 插件绕过宿主直写会话数据（如 sqlite custom_title、转录 title 行）后 调用——否则变更要等用户手动同步或下次常规刷新才可见。 |
 | `ctx.sessions.setEffort` | `host:session` | 修改已有会话的 effort 档位，0.3.10 起。直写宿主会话状态并持久化 （等价于用户在会话内切换档位，refreshSessions 不会回滚）。未知会话 或空 effort 以 rejection 失败——不会创建幽灵会话条目。 |
-| `ctx.sessions.startRun` | `host:session` | 把一个 AI 轮次跑成**宿主聊天会话**（0.3.18 起，权限 `host:session`）： 会话立刻出现在侧栏（带运行中状态，不需要手动同步），打开就是实时 流式输出；停止既能在聊天里点，也能用 `interruptRun`。会话挂在 `workspacePath` 工作区下，模型/强度/渠道只覆盖这一轮，不动用户的 全局默认。 与 `ctx.agent.start` 的分工：那个是插件自有的后台轮次（事件只回 插件，不进聊天）；这个就是「像用户自己发了一条」。需要用户看得见、 随时能接管/停止的轮次用本方法。 spawn 成功后 resolve `{ runId, sessionId }`（引擎稍后才 announce sessionId 时为 null）；轮次终止经 `plugin-run://<pluginId>` 事件回执： `{ runId, sessionId, engine, workspacePath, kind: "done" \| "error", error }`。 被用户/插件中断的轮次同样以 `done` 收尾。 |
-| `ctx.sessions.interruptRun` | `host:session` | 停止 `startRun` 起的轮次（等价于聊天里的停止按钮）。 |
-| `ctx.sessions.sendMessage` | `host:session:send` | 向明确指定的已有会话发送消息（权限 `host:session:send`）。不会 创建会话，也不会读取当前活动标签页。目标会话忙碌时，`queue` 按该会话已有顺序等待，`reject` 立即以 busy 拒绝。返回的 runId 可用于 plugin-run://<pluginId> 的 started/done/error/cancelled 回执。 |
+| `ctx.sessions.startRun` | `host:session` | 把一个 AI 轮次跑成**宿主聊天会话**（0.3.18 起，权限 `host:session`）： 会话立刻出现在侧栏（带运行中状态，不需要手动同步），打开就是实时 流式输出；停止既能在聊天里点，也能用 `interruptRun`。会话挂在 `workspacePath` 工作区下；新建轮次可覆盖模型/强度/渠道，不动用户的 全局默认，续接轮次沿用已有会话的选择。 续接忽略 model / effort / providerId 覆盖，并切回该会话；只应由用户 主动操作触发，不用于定时或后台任务。 与 `ctx.agent.start` 的分工：那个是插件自有的后台轮次（事件只回 插件，不进聊天）；这个就是「像用户自己发了一条」。需要用户看得见、 随时能接管/停止的轮次用本方法。 spawn 成功后 resolve `{ runId, sessionId }`（引擎稍后才 announce sessionId 时为 null）；轮次终止经 `plugin-run://<pluginId>` 事件回执： `{ runId, sessionId, engine, workspacePath, kind: "done" \| "error", error }`。 被用户/插件中断的轮次同样以 `done` 收尾。 |
+| `ctx.sessions.interruptRun` | `host:session` | 停止本插件通过 `startRun` 启动的在跑轮次（等价于聊天里的停止按钮）。 省略 sessionId 或传 null 时，停止本插件在该引擎与工作区下的全部在跑轮次； 提供 ID 时去除首尾空白并停止匹配的会话，拒绝空白 ID。 尚未获得原生会话 ID 时按轮次 ID 停止。无匹配轮次时拒绝。 |
 | `ctx.sessions.registerSource` | `host:session` | — |
 | `ctx.window.getState` | `host:window` | — |
 | `ctx.window.setNormalBounds` | `host:window` | — |
@@ -248,6 +248,8 @@ ui: {
   registerOverlay(def: { key?: string; component: ComponentType; order?: number }): Disposer;
   /** 权限：ui:command */
   registerCommand(def: { key: string; title(): string; keywords?(): string[]; run(): void }): Disposer;
+  /** 权限：ui:file-link-menu */
+  registerFileLinkMenuItem(def: { key?: string; label(target: FileLinkMenuTarget): string; icon?: ComponentType<{ className?: string }>; visible?(target: FileLinkMenuTarget): boolean; run(target: FileLinkMenuTarget): void | Promise<void>; order?: number }): Disposer;
   /** 权限：ui:session-menu */
   registerSessionMenuItem(def: { key?: string; label(): string; icon?: ComponentType<{ className?: string }>; danger?: boolean; run(target: SessionMenuTarget): void }): Disposer;
   /** 权限：ui:settings-section */
@@ -357,6 +359,7 @@ worktrees: {
 
 ```ts
 sessions: {
+  supportsResume: boolean;
   /** 权限：host:session */
   selectSession(engine: string, sessionId: string, workspacePath: string): Promise<void>;
   /** 权限：host:session */
@@ -364,11 +367,9 @@ sessions: {
   /** 权限：host:session */
   setEffort(engine: string, sessionId: string, workspacePath: string, effort: string): Promise<void>;
   /** 权限：host:session */
-  startRun(def: { engine: string; prompt: string; workspacePath: string; model?: string | null; effort?: string | null; providerId?: string | null }): Promise<{ runId: string; sessionId: string | null }>;
+  startRun(def: { sessionId?: string | null; engine: string; prompt: string; workspacePath: string; model?: string | null; effort?: string | null; providerId?: string | null }): Promise<{ runId: string; sessionId: string | null }>;
   /** 权限：host:session */
   interruptRun(def: { engine: string; workspacePath: string; sessionId?: string | null }): Promise<void>;
-  /** 权限：host:session:send */
-  sendMessage(def: { engine: string; sessionId: string; workspacePath: string; prompt: string; ifBusy?: "queue" | "reject" }): Promise<{ runId: string; sessionId: string }>;
   /** 权限：host:session */
   registerSource(def: { id: string; list(): Promise<ExternalSessionRow[]> }): Disposer;
 }
@@ -401,6 +402,33 @@ models: {
   listEngineModels(engine: string, workspace?: string): Promise<PluginEngineCatalog>;
   /** 权限：host:models */
   catalog(options?: { workspace?: string; refreshProviders?: boolean }): Promise<PluginModelCatalogResult>;
+}
+```
+
+### ctx.usage
+
+本机用量统计（权限 `usage.read`，0.3.25 起）。数据由宿主从各 CLI 的会话 日志计算，不上传。refresh 增量读取新内容；rescan 从头重读磁盘上全部日志 （进度经 onScanProgress），已被 CLI 清理的旧日志对应的用量保留不丢， 60 秒内重复调用会被拒绝。updatePrices 下载公开价格表（LiteLLM），应只在 用户开启自动更新或显式操作时调用；10 分钟内重复调用直接返回当前价格表。 宿主在插件首次调用后才开始后台扫描，约 10 分钟无调用即停止。
+
+```ts
+usage: {
+  query(query: UsageStatsQuery): Promise<UsageStatsResult>;
+  sources(): Promise<UsageSourceStatus[]>;
+  refresh(): Promise<UsageScanSummary>;
+  rescan(): Promise<UsageScanSummary>;
+  prices(): Promise<UsagePriceInfo>;
+  updatePrices(): Promise<UsagePriceInfo>;
+  onChange(cb: (event: { scannedAt: number }) => void): Disposer;
+  onScanProgress(cb: (progress: UsageScanProgress) => void): Disposer;
+}
+```
+
+### ctx.limits
+
+订阅限额（权限 `limits.read`，0.3.25 起）。缺省查询全部平台；宿主缓存 60 秒，refresh 跳过缓存但 20 秒内重复刷新仍复用上次结果，并遵守 429 退避。宿主读取本机 CLI 登录前先向桌面用户列出读取位置并征求同意（仅 询问一次，可在插件详情页撤销）；未同意时 get 以 `CredentialConsentRequired: ` 开头的错误拒绝，插件应提示用户而不是 重试轰炸。
+
+```ts
+limits: {
+  get(options?: { providers?: UsageLimitProviderId[]; refresh?: boolean }): Promise<UsageLimitsResult>;
 }
 ```
 
@@ -467,6 +495,7 @@ ctx.react: typeof React; // Shared host React instance: external bundles can't r
 | `ui:timeline-row` | `ctx.ui.registerTimelineRowRenderer` |
 | `ui:workspace-menu` | `ctx.ui.registerWorkspaceMenuItem` |
 | `ui:session-menu` | `ctx.ui.registerSessionMenuItem` |
+| `ui:file-link-menu` | `ctx.ui.registerFileLinkMenuItem` |
 | `ui:sidebar-entry` | `ctx.ui.registerSidebarNav` |
 | `ui:center-tab` | `ctx.ui.registerCenterTab`、`ctx.ui.openCenterTab` |
 | `ui:conversation-mode` | `ctx.ui.registerConversationMode` |
@@ -478,12 +507,13 @@ ctx.react: typeof React; // Shared host React instance: external bundles can't r
 | `network:none` | — |
 | `composer:draft` | `ctx.composer.setDraft` |
 | `host:session` | `ctx.sessions.selectSession`、`ctx.sessions.refresh`、`ctx.sessions.setEffort`、`ctx.sessions.startRun`、`ctx.sessions.interruptRun`、`ctx.sessions.registerSource` |
-| `host:session:send` | `ctx.sessions.sendMessage` |
 | `host:workspace` | `ctx.workspaces.add`、`ctx.workspaces.list` |
 | `host:workspace:remote` | `ctx.workspaces.add` |
 | `host:worktree` | `ctx.worktrees.create`、`ctx.worktrees.remove` |
 | `host:window` | `ctx.window.getState`、`ctx.window.setNormalBounds`、`ctx.window.sampleWechat` |
 | `host:models` | `ctx.models.listEngines`、`ctx.models.listEngineModels`、`ctx.models.catalog` |
+| `usage.read` | — |
+| `limits.read` | — |
 | `session.lifecycle.read` | `ctx.hooks.registerSessionHooks` |
 | `runtime.events.read` | `ctx.hooks.registerTurnHooks` |
 | `runtime.switch.observe` | `ctx.hooks.registerRuntimeSwitchHooks` |

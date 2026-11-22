@@ -1,3 +1,4 @@
+import { WorkspaceEngineDialog } from "./WorkspaceEngineDialog";
 import { useTranslation } from "react-i18next";
 import { useShallow } from "zustand/react/shallow";
 import { ConfirmDialog, ConfirmPopover, PromptDialog } from "@/components/dialogs";
@@ -43,13 +44,17 @@ export function ChatPageDialogs({
       setWorkspaceArchived: s.setWorkspaceArchived,
     })),
   );
+  const unavailable = useChatStore((s) => s.unavailableNewChat);
+  const dismissUnavailable = useChatStore((s) => s.dismissUnavailableNewChat);
   const workspaces = useChatStore((s) => s.workspaces);
   const workspaceAliases = useChatStore((s) => s.workspaceAliases);
   const closeFile = useFilesStore((s) => s.closeFile);
+  const dirtyFileName = useFilesStore((s) => dialog?.kind === "closeFile" ? s.fileStates[dialog.path]?.name ?? fileName(dialog.path) : "");
   const removeTerminalWorkspace = useTerminalStore((s) => s.removeWorkspace);
 
   return (
     <>
+      {unavailable && <WorkspaceEngineDialog key={unavailable.workspacePath} unavailable={unavailable} onClose={dismissUnavailable} />}
       {dialog?.kind === "rename" && (
         <PromptDialog
           title={t("chat.renameSession")}
@@ -67,7 +72,7 @@ export function ChatPageDialogs({
       {dialog?.kind === "closeFile" && (
         <ConfirmDialog
           danger
-          message={t("files.confirmCloseDirty", { name: fileName(dialog.path) })}
+          message={t("files.confirmCloseDirty", { name: dirtyFileName })}
           onConfirm={() => {
             closeFile(dialog.path);
             onClose();

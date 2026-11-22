@@ -21,12 +21,13 @@ const BASE_LABELS: Record<string, string> = {
   agent: "agent",
   "composer:draft": "composerDraft",
   "host:session": "hostSession",
-  "host:session:send": "hostSessionSend",
   "host:workspace": "hostWorkspace",
   "host:workspace:remote": "hostWorkspaceRemote",
   "host:worktree": "hostWorktree",
   "host:window": "hostWindow",
   "host:models": "hostModels",
+  "usage.read": "usageRead",
+  "limits.read": "limitsRead",
   "network:none": "networkNone",
 };
 
@@ -42,6 +43,7 @@ const UI_LABELS: Record<string, string> = {
   "ui:page": "uiPage",
   "ui:timeline-row": "uiTimelineRow",
   "ui:session-menu": "uiSessionMenu",
+  "ui:file-link-menu": "uiFileLinkMenu",
   "ui:sidebar-entry": "uiSidebarEntry",
   "ui:center-tab": "uiCenterTab",
   "ui:conversation-mode": "uiConversationMode",

@@ -10,6 +10,11 @@ import type {
 import type { EffortLevel } from "@/components/application/ai-chat/cli-menu";
 import type { ComposerPermission } from "@/components/application/ai-chat/permission-menu";
 import type { ActiveSession } from "./persistence";
+import type {
+  ComposerAttachmentMoves,
+  ComposerAttachments,
+  ComposerAttachmentsByKey,
+} from "./attachments";
 import type { SessionContributions } from "./session-contributions";
 import type { QueueMoveDirection, SessionState } from "./stream";
 
@@ -80,7 +85,7 @@ export interface ChatStore {
    *  app settings. */
   thinkingAutoCollapse: boolean;
   /** 宽幕布: true = the chat content column fills its pane instead of the
-   *  default centered 750px / `max-w-3xl` track. Persisted in app settings. */
+   *  centered track (750px / 48rem by default). Persisted in app settings. */
   wideLayout: boolean;
   bySession: Record<string, SessionState>;
   /** Flat sessionKey -> streaming map, written only when a flag flips. The
@@ -90,10 +95,24 @@ export interface ChatStore {
   /** Flat sessionKey -> retrying flag, written only on retry start/stop.
    * Keeps the sidebar out of the per-token bySession update path. */
   retryingByKey: Record<string, true>;
+  /** Flat sessionKey -> 分叉在飞标记（来源会话），只在分叉开始/结束时写。
+   *  分叉是点击即落盘的一次 IPC：双击会让两次调用各建一个分支，用户拿到两条
+   *  看起来一样的会话。入口据此置灰成"进行中"。只管本窗口；跨客户端的并发由
+   *  后端串行化（`fork_session_blocking`）。 */
+  forkingByKey: Record<string, true>;
   /** Sessions with activity the user has not opened yet (sidebar green dot),
    * keyed `${engine}/${sessionId}` like the sidebar thread id. In-memory only. */
   unseen: Record<string, boolean>;
   drafts: Record<string, string>;
+  /** Pending image attachments per session key. Keyed like `drafts` because a
+   * single ChatConversation instance serves every session the tab strip and
+   * the split panes show: attachments belong to the conversation, not to the
+   * component. In-memory only (pasted-image files are swept at startup). */
+  composerAttachments: ComposerAttachmentsByKey;
+  /** Recent key changes of conversations (pending → native id, engine
+   * retarget, no-tab composer → first chat): a picture still being saved
+   * when its tab changed key lands on the new key, not the old one. */
+  composerAttachmentMoves: ComposerAttachmentMoves;
   /** File-tree "+" click asking the active composer to insert an @path
    * mention; nonce re-fires for the same path. */
   pendingMention: { path: string; nonce: number } | null;
@@ -131,11 +150,23 @@ export interface ChatStore {
    *  handleAddWorkspace）。 */
   addWorkspaces: (paths: string[]) => Promise<string[]>;
   reorderWorkspaces: (ids: string[]) => Promise<void>;
+  setWorkspacePinned: (id: string, pinned: boolean) => Promise<void>;
   removeWorkspace: (id: string) => Promise<void>;
   selectSession: (
     engine: string,
     sessionId: string,
     workspacePath: string,
+  ) => Promise<void>;
+  /** Re-read one native transcript without changing the active tab or composer. */
+  reloadSession: (session: SessionMeta) => Promise<void>;
+  /** 会话分叉：以某条历史消息为分叉点，开一个继承上下文的新会话 tab。
+   *  后端**点击即落盘**（写好继承的前缀转录本并登记新会话），返回的新 tab
+   *  可以直接读历史。`anchor` 省略即从来源会话末尾（完整轮次边界）分叉。 */
+  forkSession: (
+    engine: string,
+    sessionId: string,
+    workspacePath: string,
+    anchor?: { userTextSha256: string; seqHint?: number; tailOccurrence?: number } | null,
   ) => Promise<void>;
   closeTab: (
     engine: string,
@@ -155,7 +186,11 @@ export interface ChatStore {
     workspacePath: string,
     toIndex: number,
   ) => void;
-  startNewChat: (workspacePath: string) => void;
+  workspaceDefaultEngines: Record<string, string>;
+  unavailableNewChat: { workspacePath: string; engine: string; onOpened?: () => void } | null;
+  dismissUnavailableNewChat: () => void;
+  setWorkspaceDefaultEngine: (workspaceId: string, engine: string) => Promise<void>;
+  startNewChat: (workspacePath: string, engineOverride?: string, onOpened?: () => void) => void;
   setActiveEngine: (engine: string) => void;
   setPermission: (permission: ComposerPermission) => void;
   setEffort: (engine: string, effort: EffortLevel) => Promise<void>;
@@ -199,6 +234,11 @@ export interface ChatStore {
   /** 宽幕布 (设置 → 通用 → 外观), persisted in app settings. */
   setWideLayout: (wide: boolean) => void;
   setDraft: (key: string, text: string) => void;
+  /** Replace one session's pending image attachments (null = clear). */
+  setComposerAttachments: (
+    key: string,
+    next: ComposerAttachments | null,
+  ) => void;
   /** Ask the active composer to insert an @path mention at the caret. */
   requestMention: (path: string) => void;
   clearPendingMention: () => void;
@@ -209,6 +249,10 @@ export interface ChatStore {
    *  computer-use command); the composer keeps the user's draft. */
   setSessionError: (key: string, message: string) => void;
   loadEarlier: (key?: string) => Promise<void>;
+  /** Refresh hidden delegation status deliveries from the latest history page. */
+  refreshSubagentStatus: (key: string) => Promise<void>;
+  /** Cancel retries and discard an in-flight subagent-status result. */
+  cancelSubagentStatusRefresh: (key: string) => void;
   /** 发送。`target` 不传时发给当前激活会话；分屏里每格带上自己的会话。 */
   send: (
     prompt: string,
@@ -260,7 +304,7 @@ export interface ChatStore {
   /** Drop every queued message from a session (default: the active one). */
   clearQueue: (key?: string) => void;
   /** Stop the running turn (default: the active session). */
-  interrupt: (target?: ActiveSession | null) => Promise<void>;
+  interrupt: (target?: ActiveSession | null, runId?: string) => Promise<void>;
   archiveSession: (session: SessionMeta) => Promise<void>;
   deleteSession: (engine: string, sessionId: string) => Promise<void>;
   pinSession: (

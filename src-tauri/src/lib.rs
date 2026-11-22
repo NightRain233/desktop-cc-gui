@@ -8,7 +8,6 @@ pub mod cc_switch;
 pub mod cli_lifecycle;
 pub mod clipboard;
 pub mod computer_use;
-pub mod computer_use_ax;
 pub mod config;
 pub mod creator_skill;
 pub mod cu_overlay;
@@ -32,6 +31,7 @@ pub mod pet_overlay;
 pub mod pets;
 pub mod plugin_caps;
 pub mod plugin_host;
+pub mod plugin_usage;
 pub mod plugins;
 pub mod preview_protocol;
 pub mod prompts;
@@ -44,8 +44,10 @@ pub mod settings;
 pub mod skills_hub;
 pub mod slash_commands;
 pub mod terminal;
+pub mod translate;
 pub mod updater;
-pub mod usage;
+pub mod usage_limits;
+pub mod usage_stats;
 pub mod web;
 pub mod window_state;
 
@@ -78,15 +80,22 @@ pub struct AppState {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     paths::ensure_dirs().expect("failed to create app home");
-    // MCP server mode: engine CLIs spawn this binary as a computer-use MCP
-    // child process (`--mcp-config`). stdout is the protocol channel, so no
-    // Tauri runtime — and nothing that prints to stdout — may start here.
-    if std::env::args().any(|arg| arg == "--computer-use-mcp") {
-        if let Err(error) = computer_use::mcp::serve_stdio() {
-            eprintln!("[computer-use] MCP server exited: {error}");
+    // MCP proxy mode: `--mcp-lazy -- <server command…>` starts the real
+    // server on first use (mcp/lazy.rs). Checked first and only at argv[1]:
+    // the wrapped command may itself carry `--memory-mcp` and friends.
+    if std::env::args().nth(1).as_deref() == Some(mcp::lazy::FLAG) {
+        if let Err(error) = mcp::lazy::serve(std::env::args().skip(2).collect()) {
+            eprintln!("[mcp-lazy] {error}");
             std::process::exit(1);
         }
         return;
+    }
+    // Legacy computer-use MCP mode: the driver is the separate
+    // `ccgui-computer-use` binary now; an engine config written before the
+    // split is forwarded to it. stdout is the protocol channel, so no Tauri
+    // runtime — and nothing that prints to stdout — may start here.
+    if std::env::args().any(|arg| arg == computer_use::LEGACY_MCP_FLAG) {
+        std::process::exit(computer_use::forward_to_helper());
     }
     // MCP server mode: engine CLIs spawn this binary as the per-bot memory
     // tool (`--memory-mcp --bot-id <id>`, see engine/*). Same stdout rule.
@@ -120,6 +129,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_process::init())
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
@@ -206,13 +216,15 @@ pub fn run() {
             // before manage()".
             app.manage(config::ConfigStore::default());
             // Virtual cursor overlay + its loopback control channel: the
-            // --computer-use-mcp child posts action targets here so the
+            // ccgui-computer-use helper posts action targets here so the
             // blue pointer can follow the agent.
             if let Err(error) = cu_overlay::init(app.handle()) {
                 eprintln!("[cu-overlay] init failed (overlay disabled): {error}");
             }
+            // One Baidu Tongji page view per launch, built and sent by the
+            // backend; no remote script ever runs in a webview.
+            baidu_tongji::spawn_startup_pageview(app.handle());
             app.manage(metrics::MetricsState::load().map_err(std::io::Error::other)?);
-            app.manage(baidu_tongji::BaiduTongjiState::load());
             // Keep the pairing key from lingering: while the switch is on, a
             // fresh code is minted every ten minutes and broadcast.
             {
@@ -227,17 +239,15 @@ pub fn run() {
             }
             // Initial history scan, non-blocking.
             history::scanner::spawn_scan(scan_db, scan_sink);
-            // 内置「插件开发」skill：同步进已存在引擎的 skills 根（幂等，失败
-            // 只记日志）——skill 只有落在 CLI 自己的根里才会被引擎加载，
-            // 见 creator_skill.rs 模块注释。
-            creator_skill::install_at_startup(app.handle());
-            // DSH host autostart: adopt-or-spawn in the background when
-            // enabled; failures are logged, never fatal to startup.
+            // DSH host autostart: adopt-or-spawn in the background only when
+            // the switch is on, the engine is enabled and `dsh` is installed
+            // (dsh_host::autostart_allowed) — otherwise port 3080 is not even
+            // probed. Failures are logged, never fatal to startup.
             {
                 let handle = app.handle().clone();
                 tauri::async_runtime::spawn(async move {
                     let settings = settings::read_settings().unwrap_or_default();
-                    if settings.dsh_auto_start == Some(false) {
+                    if !dsh_host::autostart_allowed(&settings) {
                         return;
                     }
                     let state = handle.state::<AppState>();
@@ -406,6 +416,7 @@ pub fn run() {
             // settings
             settings::get_app_settings,
             settings::update_app_settings,
+            settings::set_workspace_default_engine,
             settings::set_window_theme,
             // uploaded font files (设置 → 外观 字体行)
             fonts::read_font_file,
@@ -452,6 +463,17 @@ pub fn run() {
             plugin_host::plugin_list_engines,
             plugin_host::plugin_list_engine_models,
             plugin_host::plugin_model_catalog,
+            // Usage statistics & subscription limits (plugin usage.read / limits.read)
+            plugin_usage::plugin_usage_query,
+            plugin_usage::plugin_usage_sources,
+            plugin_usage::plugin_usage_refresh,
+            plugin_usage::plugin_usage_rescan,
+            plugin_usage::plugin_usage_prices,
+            plugin_usage::plugin_usage_update_prices,
+            plugin_usage::plugin_limits_get,
+            usage_limits::consent::cli_credential_consent_get,
+            usage_limits::consent::cli_credential_consent_set,
+            usage_limits::consent::cli_credential_sources,
             // plugin marketplace (Phase 3, plan §6)
             plugins::market::plugin_fetch_index,
             plugins::market::plugin_fetch_featured,
@@ -461,13 +483,14 @@ pub fn run() {
             // engine
             engine::send_message,
             engine::interrupt_session,
+            engine::run_activity,
+            engine::close_idle_codebuddy,
             engine::live_runs,
             engine::answer_question,
             engine::respond_plan_review,
             engine::list_plan_reviews,
             engine::list_engines,
             engine::models::list_engine_models,
-            engine::codebuddy::codebuddy_account_status,
             engine::pi_family_auth::pi_family_auth_list,
             engine::pi_family_auth::pi_family_auth_set_api_key,
             engine::pi_family_auth::pi_family_auth_delete_credential,
@@ -475,8 +498,11 @@ pub fn run() {
             engine::pi_family_auth::pi_family_models_config_write,
             engine::images::save_pasted_image,
             engine::images::import_attachments,
-            // clipboard file lists (paste of Finder/Explorer copies)
-            clipboard::clipboard_file_paths,
+            // clipboard file lists (paste of Finder/Explorer copies, and the
+            // file tree's Copy/Paste round trip)
+            clipboard::clipboard_file_snapshot,
+            clipboard::clipboard_change_count,
+            clipboard::clipboard_set_file_paths,
             // computer use
             computer_use::computer_use_permission_status,
             computer_use::computer_use_open_permission_settings,
@@ -485,7 +511,9 @@ pub fn run() {
             // web bridge intentionally does not dispatch these.
             mcp::mcp_inventory,
             mcp::mcp_set_enabled,
+            mcp::mcp_set_launch_mode,
             mcp::probe::mcp_probe,
+            mcp::probe::mcp_probe_plan,
             // skills hub (设置 → 能力扩展 → Skills)
             skills_hub::skills_hub_query,
             skills_hub::skills_hub_mutate,
@@ -494,16 +522,18 @@ pub fn run() {
             history::reader::list_archived_sessions,
             history::reader::archive_session,
             history::reader::restore_session,
-            usage::usage_record,
-            usage::usage_summary,
-            usage::usage_clear,
             history::reader::load_session_page,
             history::reader::load_remote_session_page,
+            history::edit::read_session_file,
+            history::edit::write_session_file,
+            history::edit::open_session_file_in_default_editor,
             history::search::search_messages,
             history::reader::delete_session,
             history::reader::delete_remote_session,
             history::reader::pin_session,
             history::reader::rename_session,
+            // 会话分叉：解析分叉点、分配新 id，并**当场**写出继承过来的前缀转录本、登记 `sessions` 行（点击即落盘，不分两次做）
+            engine::fork::fork_session,
             history::reader::remember_session_model,
             history::reader::remember_session_effort,
             history::reader::remember_session_provider,
@@ -511,17 +541,21 @@ pub fn run() {
             history::reader::list_workspaces,
             history::reader::add_workspace,
             history::reader::reorder_workspaces,
+            history::reader::set_workspace_pinned,
             history::reader::remove_workspace,
             history::reader::set_workspace_group,
             // files
             files::list_dir,
             files::read_file,
+            // HTML preview roots (desktop only; same boundary as read_file)
+            preview_protocol::preview_open,
             files::write_file,
             files::create_dir,
             files::rename_item,
             files::trash_item,
             files::duplicate_item,
             files::paste_item,
+            files::paste_clipboard_items,
             files::create_file,
             files::search_text,
             files::list_file_index,
@@ -569,6 +603,7 @@ pub fn run() {
             git::git_file_colors,
             git::git_tree_status,
             git::git_diff,
+            git::git_diff_images,
             git::git_stage,
             git::git_unstage,
             git::git_discard,
@@ -589,6 +624,8 @@ pub fn run() {
             open_app::open_workspace_in,
             open_app::open_custom_program,
             open_app::get_program_icon,
+            baidu_tongji::analytics_enabled_get,
+            baidu_tongji::analytics_enabled_set,
             open_app::reveal_in_file_manager,
             open_app::browser::open_in_browser,
             // terminal
@@ -612,6 +649,8 @@ pub fn run() {
             plugin_caps::plugin_agent_interrupt,
             mission::mission_agent_start,
             mission::mission_agent_interrupt,
+            translate::translate_text_start,
+            translate::translate_text_interrupt,
             // web access
             web::web_access_start,
             web::web_access_stop,
@@ -643,8 +682,6 @@ pub fn run() {
             cli_lifecycle::cli_update_plan,
             cli_lifecycle::cli_update,
             // baidu tongji (Linux-native transport; rejected elsewhere)
-            baidu_tongji::load_baidu_tongji_script,
-            baidu_tongji::send_baidu_tongji_beacon,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

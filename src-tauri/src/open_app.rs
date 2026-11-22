@@ -10,6 +10,7 @@ use std::path::PathBuf;
 use std::process::Stdio;
 
 pub(crate) mod browser;
+mod program_icon;
 
 #[cfg(target_os = "macos")]
 use base64::Engine as _;
@@ -319,6 +320,86 @@ pub(crate) async fn open_workspace_in(
     }
 }
 
+/// Use the OS text-editor association rather than the transcript extension.
+/// In particular, JSONL often has no association, and its open handler need
+/// not be a text editor. The original file is passed without copying it.
+#[cfg(target_os = "windows")]
+pub(crate) fn open_in_default_text_editor(path: &std::path::Path) -> Result<(), String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::{w, PCWSTR};
+    use windows::Win32::Foundation::RPC_E_CHANGED_MODE;
+    use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
+    use windows::Win32::System::Registry::RegCloseKey;
+    use windows::Win32::UI::Shell::{
+        AssocQueryKeyW, ShellExecuteExW, SHELLEXECUTEINFOW,
+        ASSOCF_NONE, ASSOCKEY_SHELLEXECCLASS,
+        SEE_MASK_CLASSKEY, SEE_MASK_FLAG_NO_UI, SEE_MASK_NOASYNC,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+    // ShellExecute requires native separators even though Rust fs accepts '/'.
+    let file: Vec<u16> = path.as_os_str().encode_wide()
+        .map(|c| if c == u16::from(b'/') { u16::from(b'\\') } else { c })
+        .chain(Some(0)).collect();
+    // Shell extensions can use COM; initialize it only for this blocking
+    // thread and balance successful initialization, including S_FALSE.
+    let initialized = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+    if initialized.is_err() && initialized != RPC_E_CHANGED_MODE {
+        return Err(format!("Failed to initialize default text editor launcher: {initialized}"));
+    }
+    let result = (|| -> windows::core::Result<()> {
+        // Query .txt with user settings, then pass the resulting key directly:
+        // a class ending in .exe can otherwise be reinterpreted as exefile.
+        let class = unsafe { AssocQueryKeyW(ASSOCF_NONE, ASSOCKEY_SHELLEXECCLASS, w!(".txt"), w!("open"))? };
+        let mut info = SHELLEXECUTEINFOW {
+            cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
+            fMask: SEE_MASK_CLASSKEY | SEE_MASK_FLAG_NO_UI | SEE_MASK_NOASYNC,
+            lpVerb: w!("open"),
+            lpFile: PCWSTR(file.as_ptr()),
+            hkeyClass: class,
+            nShow: SW_SHOWNORMAL.0,
+            ..Default::default()
+        };
+        let launched = unsafe { ShellExecuteExW(&mut info) };
+        let _ = unsafe { RegCloseKey(class) };
+        launched
+    })();
+    if initialized.is_ok() { unsafe { CoUninitialize() }; }
+    result.map_err(|e| format!("Failed to open default text editor: {e}"))
+}
+
+#[cfg(not(target_os = "windows"))]
+pub(crate) fn open_in_default_text_editor(path: &std::path::Path) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    let mut command = {
+        let mut command = std::process::Command::new("/usr/bin/open");
+        command.arg("-t");
+        command
+    };
+    #[cfg(not(target_os = "macos"))]
+    let mut command = {
+        let output = std::process::Command::new("xdg-mime")
+            .args(["query", "default", "text/plain"]).stdin(Stdio::null()).output()
+            .map_err(|e| format!("Failed to find default text editor: {e}"))?;
+        if !output.status.success() {
+            return Err(format!("Failed to find default text editor: {}", String::from_utf8_lossy(&output.stderr).trim()));
+        }
+        let desktop = std::str::from_utf8(&output.stdout)
+            .map_err(|e| format!("Invalid default text editor association: {e}"))?.trim();
+        if desktop.is_empty() { return Err("No default text editor is configured for text/plain".into()); }
+        let mut command = std::process::Command::new("gtk-launch");
+        command.arg(desktop);
+        command
+    };
+    // Editors inherit launcher handles; pipes would hold this request and its
+    // session lease until the external editor closes instead of launch exit.
+    let status = command.arg(path).stdin(Stdio::null())
+        .stdout(Stdio::null()).stderr(Stdio::null()).status()
+        .map_err(|e| format!("Failed to open default text editor: {e}"))?;
+    if status.success() { return Ok(()); }
+    Err(format!("Failed to open default text editor ({status})"))
+}
+
 /// Open a folder (or file) in a user-picked custom program.
 ///
 /// Unlike `open_workspace_in` this takes an absolute executable path from the
@@ -405,43 +486,13 @@ pub(crate) async fn get_program_icon(executable_path: String) -> Result<Option<S
 
 #[cfg(windows)]
 fn program_icon_sync(path: &str) -> Option<String> {
+    use base64::Engine as _;
     let path_buf = PathBuf::from(path);
     if !path_buf.is_file() {
         return None;
     }
-    // PowerShell single-quoted literal: a quote is escaped by doubling it.
-    let escaped = path.replace('\'', "''");
-    let script = format!(
-        r#"
-Add-Type -AssemblyName System.Drawing
-$path = '{escaped}'
-if (-not (Test-Path -LiteralPath $path)) {{ exit 1 }}
-$icon = [System.Drawing.Icon]::ExtractAssociatedIcon($path)
-if ($null -eq $icon) {{ exit 2 }}
-$bmp = $icon.ToBitmap()
-$ms = New-Object System.IO.MemoryStream
-$bmp.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png)
-[Convert]::ToBase64String($ms.ToArray())
-"#
-    );
-    let mut cmd = std::process::Command::new("powershell");
-    cmd.args(["-NoProfile", "-NonInteractive", "-Command", &script]);
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        cmd.creation_flags(CREATE_NO_WINDOW);
-    }
-    cmd.stdin(Stdio::null());
-    cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::null());
-    let output = cmd.output().ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let encoded = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if encoded.is_empty() {
-        return None;
-    }
+    let png = program_icon::program_icon_png(&path_buf)?;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(png);
     Some(format!("data:image/png;base64,{encoded}"))
 }
 

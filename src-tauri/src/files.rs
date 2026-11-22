@@ -1,10 +1,11 @@
 use base64::Engine as _;
+use encoding_rs::GBK;
 use serde::Serialize;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 const MAX_READ_BYTES: usize = 1024 * 1024;
-const MAX_IMAGE_BYTES: usize = 5 * 1024 * 1024;
+pub(crate) const MAX_IMAGE_BYTES: usize = 5 * 1024 * 1024;
 const MAX_SEARCH_RESULTS: usize = 200;
 /// @-mention file index: bounds the walk on monster trees (the gitignore
 /// filter drops build output, the cap is the last line of defense).
@@ -30,6 +31,146 @@ pub struct FileContent {
     pub text: Option<String>,
     pub data_url: Option<String>,
     pub truncated: bool,
+    pub encoding: Option<String>,
+    pub bom: bool,
+    pub decode_error: bool,
+    pub line_ending: Option<String>,
+}
+
+#[derive(Clone, Copy)]
+enum TextEncoding {
+    Utf8,
+    Gbk,
+}
+
+impl TextEncoding {
+    fn from_name(name: &str) -> Option<Self> {
+        match name.to_ascii_lowercase().as_str() {
+            "utf-8" | "utf8" => Some(Self::Utf8),
+            "gbk" | "gb2312" => Some(Self::Gbk),
+            _ => None,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Utf8 => "utf-8",
+            Self::Gbk => "gbk",
+        }
+    }
+}
+
+/// `complete` is false when the read was capped, so a character split by the
+/// cap is left out instead of being reported as a decode error.
+fn decode_text(
+    bytes: &[u8],
+    requested: Option<&str>,
+    complete: bool,
+) -> Result<(String, TextEncoding, bool, bool, &'static str), String> {
+    let has_utf8_bom = bytes.starts_with(&[0xEF, 0xBB, 0xBF]);
+    let encoding = match requested {
+        Some(name) => TextEncoding::from_name(name)
+            .ok_or_else(|| format!("unsupported text encoding: {name}"))?,
+        None if has_utf8_bom || std::str::from_utf8(bytes).is_ok() => TextEncoding::Utf8,
+        None => TextEncoding::Gbk,
+    };
+    let payload = if has_utf8_bom && matches!(encoding, TextEncoding::Utf8) {
+        &bytes[3..]
+    } else {
+        bytes
+    };
+    let (text, decode_error) = match encoding {
+        TextEncoding::Utf8 => match std::str::from_utf8(payload) {
+            Ok(text) => (text.to_string(), false),
+            Err(_) => (String::from_utf8_lossy(payload).into_owned(), true),
+        },
+        TextEncoding::Gbk => {
+            let mut decoder = GBK.new_decoder_without_bom_handling();
+            let capacity = decoder
+                .max_utf8_buffer_length(payload.len())
+                .ok_or_else(|| "text too large to decode".to_string())?;
+            let mut text = String::with_capacity(capacity);
+            let (_, _, had_errors) = decoder.decode_to_string(payload, &mut text, complete);
+            // GB18030 four-byte sequences, A2E3 and A3A0 decode cleanly but are
+            // written back as other bytes, so saving would alter untouched text.
+            let changes_on_save =
+                complete && !had_errors && GBK.encode(&text).0.as_ref() != payload;
+            (text, had_errors || changes_on_save)
+        }
+    };
+    let line_ending = detect_line_ending(&text);
+    Ok((
+        text,
+        encoding,
+        has_utf8_bom && matches!(encoding, TextEncoding::Utf8),
+        decode_error,
+        line_ending,
+    ))
+}
+
+fn detect_line_ending(text: &str) -> &'static str {
+    let crlf = text.matches("\r\n").count();
+    let lf = text.matches('\n').count().saturating_sub(crlf);
+    let cr = text.matches('\r').count().saturating_sub(crlf);
+    if crlf >= lf && crlf >= cr && crlf > 0 {
+        "crlf"
+    } else if cr > lf {
+        "cr"
+    } else {
+        "lf"
+    }
+}
+
+fn encode_text(
+    text: &str,
+    encoding: &str,
+    bom: bool,
+    line_ending: Option<&str>,
+) -> Result<Vec<u8>, String> {
+    let encoding = TextEncoding::from_name(encoding)
+        .ok_or_else(|| format!("unsupported text encoding: {encoding}"))?;
+    let text = if let Some(line_ending) = line_ending {
+        let line_ending = match line_ending {
+            "lf" => "\n",
+            "crlf" => "\r\n",
+            "cr" => "\r",
+            other => return Err(format!("unsupported line ending: {other}")),
+        };
+        let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+        if line_ending == "\n" {
+            normalized
+        } else {
+            normalized.replace('\n', line_ending)
+        }
+    } else {
+        text.to_string()
+    };
+    let mut bytes = match encoding {
+        TextEncoding::Utf8 => text.as_bytes().to_vec(),
+        TextEncoding::Gbk => {
+            let (encoded, _, had_errors) = GBK.encode(&text);
+            if had_errors {
+                let mut line = 1;
+                let mut previous = '\0';
+                let character = text.chars().find(|&character| {
+                    // CRLF, CR and LF each end one line.
+                    if character == '\r' || (character == '\n' && previous != '\r') {
+                        line += 1;
+                    }
+                    previous = character;
+                    let mut buffer = [0; 4];
+                    GBK.encode(character.encode_utf8(&mut buffer)).2
+                });
+                let character = character.unwrap_or('\u{FFFD}');
+                return Err(format!("file_encoding_unrepresentable:{line}:{character}"));
+            }
+            encoded.into_owned()
+        }
+    };
+    if bom && matches!(encoding, TextEncoding::Utf8) {
+        bytes.splice(0..0, [0xEF, 0xBB, 0xBF]);
+    }
+    Ok(bytes)
 }
 
 #[derive(Serialize)]
@@ -110,18 +251,17 @@ fn allowed_roots(db: &crate::db::Db) -> Vec<PathBuf> {
 }
 
 pub(crate) fn ensure_allowed(path: &str, db: &crate::db::Db) -> Result<PathBuf, String> {
-    let trimmed = path.trim();
-    if trimmed.is_empty() {
+    // No trim: a trailing-space filename is a real, distinct path. Only a
+    // whitespace-only input is rejected as empty.
+    if path.trim().is_empty() {
         return Err("empty path".to_string());
     }
-    let resolved = canonicalize_lenient(Path::new(trimmed))?;
+    let resolved = canonicalize_lenient(Path::new(path))?;
     let roots = allowed_roots(db);
     if roots.iter().any(|root| resolved.starts_with(root)) {
         Ok(resolved)
     } else {
-        Err(format!(
-            "path is outside the registered workspaces: {trimmed}"
-        ))
+        Err(format!("path is outside the registered workspaces: {path}"))
     }
 }
 
@@ -140,7 +280,7 @@ fn strip_verbatim_prefix(path: PathBuf) -> PathBuf {
 /// a directory, otherwise its parent (granting a single file would not cover
 /// its siblings, which is never what the file-tree user wants).
 fn grant_dir_for(path: &str) -> Result<PathBuf, String> {
-    let resolved = canonicalize_lenient(Path::new(path.trim()))?;
+    let resolved = canonicalize_lenient(Path::new(path))?;
     let dir = if resolved.is_dir() {
         resolved
     } else {
@@ -264,7 +404,7 @@ pub async fn list_dir(
     .map_err(|e| e.to_string())?
 }
 
-fn is_image(path: &Path) -> bool {
+pub(crate) fn is_image(path: &Path) -> bool {
     matches!(
         path.extension()
             .and_then(|e| e.to_str())
@@ -275,7 +415,7 @@ fn is_image(path: &Path) -> bool {
     )
 }
 
-fn image_mime(path: &Path) -> &'static str {
+pub(crate) fn image_mime(path: &Path) -> &'static str {
     match path
         .extension()
         .and_then(|e| e.to_str())
@@ -295,7 +435,11 @@ fn image_mime(path: &Path) -> &'static str {
 
 /// Sync body of `read_file`; the command wrapper runs it off the main
 /// thread via spawn_blocking (a 1MB read must not stall IPC).
-fn read_file_blocking(db: &crate::db::Db, path: &str) -> Result<FileContent, String> {
+fn read_file_blocking(
+    db: &crate::db::Db,
+    path: &str,
+    encoding_override: Option<&str>,
+) -> Result<FileContent, String> {
     let file = ensure_allowed(path, db)?;
     let meta = std::fs::metadata(&file).map_err(|e| format!("stat {}: {e}", file.display()))?;
     if is_image(&file) {
@@ -313,6 +457,10 @@ fn read_file_blocking(db: &crate::db::Db, path: &str) -> Result<FileContent, Str
             text: None,
             data_url: Some(data_url),
             truncated: false,
+            encoding: None,
+            bom: false,
+            decode_error: false,
+            line_ending: None,
         });
     }
     let mut bytes = Vec::new();
@@ -327,6 +475,13 @@ fn read_file_blocking(db: &crate::db::Db, path: &str) -> Result<FileContent, Str
     let truncated = bytes.len() > MAX_READ_BYTES;
     if truncated {
         bytes.truncate(MAX_READ_BYTES);
+        // A byte cap can split a UTF-8 scalar. Drop only the incomplete suffix
+        // so the valid prefix is not mistaken for legacy-encoded text.
+        if let Err(error) = std::str::from_utf8(&bytes) {
+            if error.error_len().is_none() {
+                bytes.truncate(error.valid_up_to());
+            }
+        }
     }
     // Binary detection: NUL in the first 8KB.
     if bytes[..bytes.len().min(8192)].contains(&0) {
@@ -335,13 +490,23 @@ fn read_file_blocking(db: &crate::db::Db, path: &str) -> Result<FileContent, Str
             text: None,
             data_url: None,
             truncated: false,
+            encoding: None,
+            bom: false,
+            decode_error: false,
+            line_ending: None,
         });
     }
+    let (text, encoding, bom, decode_error, line_ending) =
+        decode_text(&bytes, encoding_override, !truncated)?;
     Ok(FileContent {
         kind: "text".to_string(),
-        text: Some(String::from_utf8_lossy(&bytes).to_string()),
+        text: Some(text),
         data_url: None,
         truncated,
+        encoding: Some(encoding.name().to_string()),
+        bom,
+        decode_error,
+        line_ending: Some(line_ending.to_string()),
     })
 }
 
@@ -349,11 +514,14 @@ fn read_file_blocking(db: &crate::db::Db, path: &str) -> Result<FileContent, Str
 pub async fn read_file(
     db: tauri::State<'_, Arc<crate::db::Db>>,
     path: String,
+    encoding: Option<String>,
 ) -> Result<FileContent, String> {
     let db = Arc::clone(db.inner());
-    tauri::async_runtime::spawn_blocking(move || read_file_blocking(&db, &path))
-        .await
-        .map_err(|e| e.to_string())?
+    tauri::async_runtime::spawn_blocking(move || {
+        read_file_blocking(&db, &path, encoding.as_deref())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -361,11 +529,20 @@ pub async fn write_file(
     db: tauri::State<'_, Arc<crate::db::Db>>,
     path: String,
     content: String,
+    encoding: Option<String>,
+    bom: Option<bool>,
+    line_ending: Option<String>,
 ) -> Result<(), String> {
     let db = Arc::clone(db.inner());
     tauri::async_runtime::spawn_blocking(move || {
         let file = ensure_allowed(&path, &db)?;
-        std::fs::write(&file, content).map_err(|e| format!("write {}: {e}", file.display()))
+        let bytes = encode_text(
+            &content,
+            encoding.as_deref().unwrap_or("utf-8"),
+            bom.unwrap_or(false),
+            line_ending.as_deref(),
+        )?;
+        std::fs::write(&file, bytes).map_err(|e| format!("write {}: {e}", file.display()))
     })
     .await
     .map_err(|e| e.to_string())?
@@ -422,6 +599,23 @@ pub async fn rename_item(
     .map_err(|e| e.to_string())?
 }
 
+/// Move `path` to the OS trash in-process. On macOS the trash crate defaults
+/// to asking Finder through `osascript`: an Automation permission prompt, and
+/// an osascript → Finder process chain that endpoint security associates
+/// with macOS stealers. NSFileManager's `trashItemAtURL` needs neither. The
+/// trade-off: Finder's "Put Back" may be missing for these items; dragging
+/// them out of the Trash still restores them.
+pub(crate) fn move_to_trash(path: &Path) -> Result<(), trash::Error> {
+    #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
+    let mut context = trash::TrashContext::default();
+    #[cfg(target_os = "macos")]
+    {
+        use trash::macos::{DeleteMethod, TrashContextExtMacos};
+        context.set_delete_method(DeleteMethod::NsFileManager);
+    }
+    context.delete(path)
+}
+
 #[tauri::command]
 pub async fn trash_item(
     db: tauri::State<'_, Arc<crate::db::Db>>,
@@ -430,7 +624,7 @@ pub async fn trash_item(
     let db = Arc::clone(db.inner());
     tauri::async_runtime::spawn_blocking(move || {
         let target = ensure_allowed(&path, &db)?;
-        trash::delete(&target).map_err(|e| format!("trash {}: {e}", target.display()))
+        move_to_trash(&target).map_err(|e| format!("trash {}: {e}", target.display()))
     })
     .await
     .map_err(|e| e.to_string())?
@@ -462,7 +656,11 @@ fn copy_destination_name(source: &Path, is_dir: bool, counter: u32) -> Result<St
     })
 }
 
-fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), String> {
+fn copy_dir_recursive_with(
+    src: &Path,
+    dst: &Path,
+    copy_file: &mut impl FnMut(&Path, &Path) -> Result<u64, String>,
+) -> Result<(), String> {
     std::fs::create_dir_all(dst).map_err(|e| format!("mkdir {}: {e}", dst.display()))?;
     let entries = std::fs::read_dir(src).map_err(|e| format!("read {}: {e}", src.display()))?;
     for entry in entries {
@@ -476,10 +674,9 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), String> {
             return Err(format!("cannot copy symlink {}", src_path.display()));
         }
         if src_path.is_dir() {
-            copy_dir_recursive(&src_path, &dst_path)?;
+            copy_dir_recursive_with(&src_path, &dst_path, copy_file)?;
         } else {
-            std::fs::copy(&src_path, &dst_path)
-                .map_err(|e| format!("copy {}: {e}", src_path.display()))?;
+            copy_file(&src_path, &dst_path)?;
         }
     }
     Ok(())
@@ -488,11 +685,12 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), String> {
 /// Copy `source` into `target_dir`, picking a collision-free destination
 /// (`prefer_original_name` keeps the plain name when it is free — paste;
 /// duplicates always take the " copy" suffix). Returns the destination.
-fn copy_item_into_dir(
+fn copy_item_into_dir_with(
     source: &Path,
     is_dir: bool,
     target_dir: &Path,
     prefer_original_name: bool,
+    copy_file: &mut impl FnMut(&Path, &Path) -> Result<u64, String>,
 ) -> Result<PathBuf, String> {
     if is_dir && target_dir.starts_with(source) {
         return Err("cannot paste a folder into itself or its descendant".to_string());
@@ -511,13 +709,288 @@ fn copy_item_into_dir(
             .find(|candidate| !candidate.exists())
             .ok_or_else(|| "too many copies exist".to_string())?;
     }
+    // A unique staged name isolates concurrent copies; only this operation's
+    // temporary item is ever cleaned up. It does not embed the source name:
+    // a long name plus the suffix would exceed the 255-unit name limit and
+    // fail a copy whose real destination fits.
+    let temporary = target_dir.join(format!(".ccgui-copying-{}", uuid::Uuid::new_v4()));
     if is_dir {
-        copy_dir_recursive(source, &destination)?;
+        std::fs::create_dir(&temporary)
+            .map_err(|error| format!("mkdir {}: {error}", temporary.display()))?;
+    }
+    let copy_result = if is_dir {
+        copy_dir_recursive_with(source, &temporary, copy_file)
     } else {
-        std::fs::copy(source, &destination)
-            .map_err(|e| format!("copy {}: {e}", source.display()))?;
+        copy_file(source, &temporary).map(|_| ())
+    };
+    if let Err(error) = copy_result {
+        return Err(remove_partial_copy(&temporary, is_dir, error));
+    }
+    if let Err(error) = publish_copy(&temporary, &destination) {
+        let error = format!("rename {}: {error}", destination.display());
+        return Err(remove_partial_copy(&temporary, is_dir, error));
     }
     Ok(destination)
+}
+
+/// Publish a complete staged item without replacing a destination that
+/// appeared while it was being copied. All staging paths are siblings of the
+/// destination, so the rename stays on one filesystem.
+fn publish_copy(from: &Path, to: &Path) -> std::io::Result<()> {
+    publish_copy_with(from, to, rename_exclusive)
+}
+
+/// Some filesystems have no exclusive rename: exFAT on macOS answers
+/// `RENAME_EXCL` with ENOTSUP, and network or FUSE mounts on Linux may reject
+/// `RENAME_NOREPLACE` with EINVAL. Duplicate and paste must keep working
+/// there, so the fallback checks the destination and then renames; a
+/// destination created in that narrow window can still be replaced, which is
+/// the best such a filesystem offers.
+fn publish_copy_with(
+    from: &Path,
+    to: &Path,
+    exclusive: impl FnOnce(&Path, &Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    match exclusive(from, to) {
+        Err(error) if exclusive_rename_unsupported(&error) => {
+            if std::fs::symlink_metadata(to).is_ok() {
+                return Err(std::io::Error::from(std::io::ErrorKind::AlreadyExists));
+            }
+            std::fs::rename(from, to)
+        }
+        result => result,
+    }
+}
+
+#[cfg(unix)]
+fn exclusive_rename_unsupported(error: &std::io::Error) -> bool {
+    error.raw_os_error().is_some_and(|code| {
+        [libc::ENOTSUP, libc::EOPNOTSUPP, libc::EINVAL, libc::ENOSYS].contains(&code)
+    })
+}
+
+/// `MoveFileExW` without `MOVEFILE_REPLACE_EXISTING` works on every Windows
+/// filesystem, so there is nothing to fall back from.
+#[cfg(windows)]
+fn exclusive_rename_unsupported(_error: &std::io::Error) -> bool {
+    false
+}
+
+/// `std`'s legacy limit for Windows paths: directory paths are capped at 248
+/// UTF-16 units (260 for files) unless the `\\?\` prefix lifts the limit.
+#[cfg(windows)]
+const WINDOWS_LEGACY_MAX_PATH: usize = 248;
+
+#[cfg(windows)]
+fn rename_exclusive(from: &Path, to: &Path) -> std::io::Result<()> {
+    use windows::Win32::Storage::FileSystem::{MoveFileExW, MOVE_FILE_FLAGS};
+
+    let from = wide_path(from)?;
+    let to = wide_path(to)?;
+    // Without MOVEFILE_REPLACE_EXISTING, MoveFileExW refuses to replace an
+    // existing file; existing directories are rejected either way.
+    unsafe {
+        MoveFileExW(
+            windows::core::PCWSTR(from.as_ptr()),
+            windows::core::PCWSTR(to.as_ptr()),
+            MOVE_FILE_FLAGS(0),
+        )
+    }
+    .map_err(win32_io_error)
+}
+
+/// `MoveFileExW` gets the raw path, so it has neither the `\\?\` prefix nor
+/// the normalization `std::fs` applies before every call: a path near
+/// `MAX_PATH` fails with `ERROR_PATH_NOT_FOUND` even though each `std::fs`
+/// step of the same copy succeeded. Paths past the legacy limit are therefore
+/// made absolute by `GetFullPathNameW` — the verbatim prefix turns off `\..`
+/// expansion, so the absolute form must come from the API — and get the
+/// prefix; shorter absolute paths are passed through untouched.
+#[cfg(windows)]
+fn wide_path(path: &Path) -> std::io::Result<Vec<u16>> {
+    use std::os::windows::ffi::OsStrExt;
+
+    const SEP: u16 = b'\\' as u16;
+    const ALT_SEP: u16 = b'/' as u16;
+    const COLON: u16 = b':' as u16;
+    const DOT: u16 = b'.' as u16;
+    const QUERY: u16 = b'?' as u16;
+    const VERBATIM: [u16; 4] = [SEP, SEP, QUERY, SEP];
+    const NT: [u16; 4] = [SEP, QUERY, QUERY, SEP];
+    const UNC: [u16; 8] = [
+        SEP,
+        SEP,
+        QUERY,
+        SEP,
+        b'U' as u16,
+        b'N' as u16,
+        b'C' as u16,
+        SEP,
+    ];
+
+    let wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+    if wide.starts_with(&VERBATIM) || wide.starts_with(&NT) {
+        return Ok(nul_terminated(wide));
+    }
+    let short_and_absolute = matches!(
+        wide.as_slice(),
+        [drive, COLON, SEP | ALT_SEP, ..] if *drive != SEP && *drive != ALT_SEP
+    ) || matches!(wide.as_slice(), [SEP | ALT_SEP, SEP | ALT_SEP, ..]);
+    if short_and_absolute && wide.len() < WINDOWS_LEGACY_MAX_PATH {
+        return Ok(nul_terminated(wide));
+    }
+
+    let mut absolute = full_path(&wide)?;
+    let prefix: &[u16] = match absolute.as_slice() {
+        // C:\... => \\?\C:\...
+        [_, COLON, SEP, ..] => &VERBATIM,
+        // \\.\... => \\?\...
+        [SEP, SEP, DOT, SEP, ..] => {
+            absolute.drain(..4);
+            &VERBATIM
+        }
+        // Already verbatim.
+        [SEP, SEP, QUERY, SEP, ..] | [SEP, QUERY, QUERY, SEP, ..] => &[],
+        // \\server\share => \\?\UNC\server\share
+        [SEP, SEP, ..] => {
+            absolute.drain(..2);
+            &UNC
+        }
+        _ => &[],
+    };
+    let mut wide = Vec::with_capacity(prefix.len() + absolute.len() + 1);
+    wide.extend_from_slice(prefix);
+    wide.extend_from_slice(&absolute);
+    wide.push(0);
+    Ok(wide)
+}
+
+#[cfg(windows)]
+fn nul_terminated(mut wide: Vec<u16>) -> Vec<u16> {
+    wide.push(0);
+    wide
+}
+
+/// Absolute, Windows-normalized form of `wide` (`/` becomes `\`, `.` and `..`
+/// collapse). `GetFullPathNameW` reports the needed buffer size when the one
+/// handed in is too small; a successful call returns the length without NUL.
+#[cfg(windows)]
+fn full_path(wide: &[u16]) -> std::io::Result<Vec<u16>> {
+    use windows::core::PCWSTR;
+    use windows::Win32::Storage::FileSystem::GetFullPathNameW;
+
+    let input = nul_terminated(wide.to_vec());
+    let mut buffer = vec![0u16; wide.len().max(WINDOWS_LEGACY_MAX_PATH)];
+    loop {
+        let len = unsafe {
+            GetFullPathNameW(PCWSTR(input.as_ptr()), Some(&mut buffer[..]), None)
+        } as usize;
+        if len == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if len < buffer.len() {
+            buffer.truncate(len);
+            return Ok(buffer);
+        }
+        buffer = vec![0u16; len];
+    }
+}
+
+/// `MoveFileExW` reports Win32 failures as `HRESULT_FROM_WIN32`; unwrap them so
+/// callers see the OS error code, kind and text `std::fs` would have produced.
+#[cfg(windows)]
+fn win32_io_error(error: windows::core::Error) -> std::io::Error {
+    let code = error.code().0 as u32;
+    match code & 0xFFFF_0000 {
+        0x8007_0000 => std::io::Error::from_raw_os_error((code & 0xFFFF) as i32),
+        _ => std::io::Error::other(error.to_string()),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn rename_exclusive(from: &Path, to: &Path) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let from = CString::new(from.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::other("copy path contains a NUL byte"))?;
+    let to = CString::new(to.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::other("copy path contains a NUL byte"))?;
+    // SAFETY: both NUL-terminated paths are alive for the call; RENAME_EXCL
+    // asks the host filesystem to reject an existing destination atomically.
+    if unsafe { libc::renamex_np(from.as_ptr(), to.as_ptr(), libc::RENAME_EXCL) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+fn rename_exclusive(from: &Path, to: &Path) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let from = CString::new(from.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::other("copy path contains a NUL byte"))?;
+    let to = CString::new(to.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::other("copy path contains a NUL byte"))?;
+    // SAFETY: AT_FDCWD resolves both relative paths against this process's
+    // unchanged working directory. Absolute staging paths are used in practice.
+    if unsafe {
+        libc::renameat2(
+            libc::AT_FDCWD,
+            from.as_ptr(),
+            libc::AT_FDCWD,
+            to.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    } == 0
+    {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+fn remove_partial_copy(path: &Path, is_dir: bool, error: String) -> String {
+    let cleanup = if is_dir {
+        std::fs::remove_dir_all(path)
+    } else {
+        std::fs::remove_file(path)
+    };
+    match cleanup {
+        Ok(()) => error,
+        // A copy may fail before creating its temporary file. There is no
+        // partial item to report in that case.
+        Err(cleanup_error) if cleanup_error.kind() == std::io::ErrorKind::NotFound => error,
+        Err(cleanup_error) => format!(
+            "{error}; partial copy remains at {}: {cleanup_error}",
+            path.display()
+        ),
+    }
+}
+
+fn copy_item_into_dir(
+    source: &Path,
+    is_dir: bool,
+    target_dir: &Path,
+    prefer_original_name: bool,
+) -> Result<PathBuf, String> {
+    copy_item_into_dir_with(
+        source,
+        is_dir,
+        target_dir,
+        prefer_original_name,
+        // std::fs::copy is what duplicate/paste used before staging: it keeps
+        // mode bits, and on macOS clones on APFS (instant, no extra space)
+        // keeping timestamps and extended attributes. The staged name is
+        // unique, so the only file it can overwrite is the AppleDouble
+        // `._name` sidecar macOS itself just wrote on a FAT / exFAT volume.
+        &mut |source, destination| {
+            std::fs::copy(source, destination)
+                .map_err(|e| format!("copy {}: {e}", source.display()))
+        },
+    )
 }
 
 #[tauri::command]
@@ -572,6 +1045,92 @@ pub async fn paste_item(
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+/// Outcome of pasting the OS clipboard: items that landed, and the reason
+/// each rejected one stayed behind (one bad entry must not lose the rest).
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PasteClipboardResult {
+    pub created: Vec<FileOpResult>,
+    pub failed: Vec<String>,
+}
+
+/// Copy host-clipboard file references into `target_dir`.
+///
+/// The source paths are read from the OS clipboard **inside the host** and
+/// never travel through IPC: a renderer-supplied "paste from anywhere" would
+/// be an arbitrary-filesystem read once the copy lands inside a workspace
+/// (where `read_file` is allowed). The destination is still confined to the
+/// registered roots.
+fn copy_clipboard_items_into(sources: &[String], target_dir: &Path) -> PasteClipboardResult {
+    let mut created = Vec::new();
+    let mut failed = Vec::new();
+    for raw in sources {
+        let original = Path::new(raw);
+        let original_meta = match std::fs::symlink_metadata(original) {
+            Ok(meta) => meta,
+            Err(e) => {
+                failed.push(format!("stat {}: {e}", original.display()));
+                continue;
+            }
+        };
+        if original_meta.file_type().is_symlink() {
+            failed.push(format!("cannot copy symlink {}", original.display()));
+            continue;
+        }
+        let source = match canonicalize_lenient(original) {
+            Ok(source) => source,
+            Err(e) => {
+                failed.push(e);
+                continue;
+            }
+        };
+        let is_dir = match std::fs::metadata(&source) {
+            Ok(meta) => meta.is_dir(),
+            Err(e) => {
+                failed.push(format!("stat {}: {e}", source.display()));
+                continue;
+            }
+        };
+        match copy_item_into_dir(&source, is_dir, target_dir, true) {
+            Ok(destination) => created.push(FileOpResult {
+                path: destination.to_string_lossy().into_owned(),
+                is_dir,
+            }),
+            Err(e) => failed.push(e),
+        }
+    }
+    PasteClipboardResult { created, failed }
+}
+
+/// Paste whatever file list the OS clipboard holds (a Finder / Explorer
+/// copy). Empty `created` + empty `failed` means the clipboard carried no
+/// file at all; the frontend then falls back to its own tree clipboard.
+///
+/// Only the clipboard read runs on the main thread. The copy, which can be a
+/// whole folder from another volume, runs on a blocking worker like
+/// `paste_item`, so the window keeps responding while it lasts.
+#[tauri::command]
+pub async fn paste_clipboard_items(
+    app: tauri::AppHandle,
+    db: tauri::State<'_, Arc<crate::db::Db>>,
+    target_dir: String,
+) -> Result<PasteClipboardResult, String> {
+    let db = Arc::clone(db.inner());
+    let dir = tauri::async_runtime::spawn_blocking(move || {
+        let dir = ensure_allowed(&target_dir, &db)?;
+        if !dir.is_dir() {
+            return Err(format!("{} is not a directory", dir.display()));
+        }
+        Ok(dir)
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    let snapshot = crate::clipboard::os_file_snapshot_on_main_thread(&app).await?;
+    tauri::async_runtime::spawn_blocking(move || copy_clipboard_items_into(&snapshot.paths, &dir))
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// Case-insensitive substring check. ASCII haystack+needle take an
@@ -738,6 +1297,200 @@ pub async fn list_file_index(
 mod tests {
     use super::*;
 
+    #[test]
+    fn decodes_gbk_and_preserves_encoding_when_saving() {
+        let source = [0xD6, 0xD0, 0xCE, 0xC4];
+        let (text, encoding, bom, decode_error, _) = decode_text(&source, None, true).unwrap();
+        assert_eq!(text, "中文");
+        assert_eq!(encoding.name(), "gbk");
+        assert!(!bom);
+        assert!(!decode_error);
+        assert_eq!(
+            encode_text(&text, encoding.name(), bom, None)
+                .unwrap()
+                .as_slice(),
+            &source
+        );
+    }
+
+    #[test]
+    fn detects_utf8_bom_and_preserves_it_on_save() {
+        let source = [0xEF, 0xBB, 0xBF, b'h', b'i'];
+        let (text, encoding, bom, decode_error, _) = decode_text(&source, None, true).unwrap();
+        assert_eq!(text, "hi");
+        assert_eq!(encoding.name(), "utf-8");
+        assert!(bom);
+        assert!(!decode_error);
+        assert_eq!(
+            encode_text(&text, encoding.name(), bom, None)
+                .unwrap()
+                .as_slice(),
+            &source
+        );
+    }
+
+    #[test]
+    fn requested_encoding_overrides_automatic_detection() {
+        let source = [0xD6, 0xD0, 0xCE, 0xC4];
+        let (text, encoding, _, decode_error, _) =
+            decode_text(&source, Some("utf-8"), true).unwrap();
+        assert_eq!(encoding.name(), "utf-8");
+        assert!(decode_error);
+        assert!(text.contains('\u{FFFD}'));
+    }
+
+    #[test]
+    fn rejects_gbk_save_when_text_has_unrepresentable_characters() {
+        assert_eq!(
+            encode_text("中文🛠", "gbk", false, None).unwrap_err(),
+            "file_encoding_unrepresentable:1:🛠"
+        );
+    }
+
+    #[test]
+    fn preserves_crlf_when_saving_editor_text() {
+        let source = b"first\r\nsecond\r\n";
+        let (text, _, _, _, line_ending) = decode_text(source, None, true).unwrap();
+        assert_eq!(line_ending, "crlf");
+        assert_eq!(
+            encode_text(&text, "utf-8", false, Some(line_ending))
+                .unwrap()
+                .as_slice(),
+            source
+        );
+    }
+
+    #[test]
+    fn truncated_utf8_cut_mid_character_stays_utf8() {
+        let scratch = Scratch::new();
+        let db = crate::db::Db::open_at(&scratch.0.join("test.db")).unwrap();
+        let workspace = Scratch::new();
+        grant_root_in(&db, &workspace.0.to_string_lossy()).unwrap();
+        for pad in 0..3 {
+            let mut source = vec![b'a'; pad];
+            while source.len() <= MAX_READ_BYTES {
+                source.extend_from_slice("这是一份普通的中文说明文档内容".as_bytes());
+            }
+            let path = workspace.0.join(format!("big-{pad}.md"));
+            std::fs::write(&path, source).unwrap();
+            let content = read_file_blocking(&db, path.to_str().unwrap(), None).unwrap();
+            assert!(content.truncated, "pad {pad}");
+            assert_eq!(content.encoding.as_deref(), Some("utf-8"), "pad {pad}");
+            assert!(!content.decode_error, "pad {pad}");
+            let text = content.text.unwrap();
+            assert!(text.contains("这是一份普通的中文说明文档内容"), "pad {pad}");
+            assert!(!text.contains('\u{FFFD}'), "pad {pad}");
+        }
+    }
+
+    #[test]
+    fn truncated_gbk_is_still_detected_as_gbk() {
+        let scratch = Scratch::new();
+        let db = crate::db::Db::open_at(&scratch.0.join("test.db")).unwrap();
+        let workspace = Scratch::new();
+        grant_root_in(&db, &workspace.0.to_string_lossy()).unwrap();
+        let encoded = GBK.encode("这是一份普通的中文说明文档内容").0;
+        // pad 1 makes the byte cap land between the two bytes of a character.
+        for pad in 0..2 {
+            let mut source = vec![b'a'; pad];
+            while source.len() <= MAX_READ_BYTES {
+                source.extend_from_slice(&encoded);
+            }
+            let path = workspace.0.join(format!("big-gbk-{pad}.txt"));
+            std::fs::write(&path, source).unwrap();
+            let content = read_file_blocking(&db, path.to_str().unwrap(), None).unwrap();
+            assert!(content.truncated, "pad {pad}");
+            assert_eq!(content.encoding.as_deref(), Some("gbk"), "pad {pad}");
+            assert!(!content.decode_error, "pad {pad}");
+            let text = content.text.unwrap();
+            assert!(
+                text[pad..].starts_with("这是一份普通的中文说明文档内容"),
+                "pad {pad}"
+            );
+            assert!(!text.contains('\u{FFFD}'), "pad {pad}");
+        }
+    }
+
+    #[test]
+    fn gbk_bytes_that_cannot_be_written_back_identically_are_read_only() {
+        // GB18030 four-byte sequence, A2E3 (saved back as 80) and A3A0 (saved back as A1A1).
+        for source in [&[0x81, 0x30, 0x81, 0x30][..], &[0xA2, 0xE3], &[0xA3, 0xA0]] {
+            let (_, encoding, _, decode_error, _) = decode_text(source, Some("gbk"), true).unwrap();
+            assert_eq!(encoding.name(), "gbk");
+            assert!(decode_error, "{source:02X?}");
+        }
+    }
+
+    #[test]
+    fn gbk_refusal_counts_cr_and_crlf_lines() {
+        assert_eq!(
+            encode_text("一\n二\n三✓\n", "gbk", false, Some("cr")).unwrap_err(),
+            "file_encoding_unrepresentable:3:✓"
+        );
+        assert_eq!(
+            encode_text("一\n二✓\n", "gbk", false, Some("crlf")).unwrap_err(),
+            "file_encoding_unrepresentable:2:✓"
+        );
+    }
+
+    #[test]
+    fn manual_gbk_does_not_follow_a_utf8_bom() {
+        let mut source = vec![0xEF, 0xBB, 0xBF];
+        source.extend_from_slice("中文\n".as_bytes());
+        let (text, encoding, bom, _, _) = decode_text(&source, Some("gbk"), true).unwrap();
+        assert_eq!(encoding.name(), "gbk");
+        assert!(!bom);
+        assert_eq!(text, GBK.decode_without_bom_handling(&source).0);
+    }
+
+    #[test]
+    fn utf16_bom_is_not_decoded_and_labelled_as_gbk() {
+        let mut source = vec![0xFF, 0xFE];
+        for unit in "中文内容".encode_utf16() {
+            source.extend_from_slice(&unit.to_le_bytes());
+        }
+        let (text, _, _, decode_error, _) = decode_text(&source, None, true).unwrap();
+        assert_ne!(text, "中文内容");
+        assert!(decode_error);
+    }
+
+    #[test]
+    fn gbk_refusal_names_the_offending_character_and_line() {
+        let error = encode_text("第一行\n第二行✓\n", "gbk", false, None).unwrap_err();
+        assert_eq!(error, "file_encoding_unrepresentable:2:✓");
+    }
+
+    #[test]
+    fn missing_line_ending_preserves_input_bytes() {
+        let source = "first\r\nsecond\rthird\n";
+        assert_eq!(
+            encode_text(source, "utf-8", false, None).unwrap(),
+            source.as_bytes()
+        );
+    }
+
+    /// Every trash goes through `move_to_trash`: the trash crate's own
+    /// `delete` defaults to an osascript → Finder chain on macOS.
+    #[test]
+    fn trash_calls_go_through_move_to_trash() {
+        let needle = ["trash", "::delete("].concat();
+        let mut offenders = Vec::new();
+        let mut stack = vec![PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src")];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().is_some_and(|ext| ext == "rs")
+                    && std::fs::read_to_string(&path).unwrap().contains(&needle)
+                {
+                    offenders.push(path.display().to_string());
+                }
+            }
+        }
+        assert!(offenders.is_empty(), "direct trash deletes: {offenders:?}");
+    }
+
     struct Scratch(PathBuf);
     impl Scratch {
         fn new() -> Self {
@@ -825,6 +1578,291 @@ mod tests {
         let dir = grant_dir_for(&outside.0.to_string_lossy()).unwrap();
         let want = strip_verbatim_prefix(std::fs::canonicalize(&outside.0).unwrap());
         assert_eq!(dir, want);
+    }
+
+    /// A trailing space is a real part of the filename on Unix; the
+    /// authorization entry points must resolve it verbatim instead of
+    /// trimming it into the sibling file without the space.
+    #[cfg(unix)]
+    #[test]
+    fn trailing_space_path_is_authorized_verbatim() {
+        let scratch = Scratch::new();
+        let plain = scratch.0.join("report");
+        let spaced = scratch.0.join("report ");
+        std::fs::write(&plain, b"plain").unwrap();
+        std::fs::write(&spaced, b"spaced").unwrap();
+        let db = crate::db::Db::open_at(&scratch.0.join("test.db")).unwrap();
+        db.add_granted_root(&scratch.0.to_string_lossy()).unwrap();
+
+        let resolved = ensure_allowed(&spaced.to_string_lossy(), &db).unwrap();
+        assert_eq!(resolved, std::fs::canonicalize(&spaced).unwrap());
+
+        let grant = grant_dir_for(&spaced.to_string_lossy()).unwrap();
+        let want = strip_verbatim_prefix(std::fs::canonicalize(&scratch.0).unwrap());
+        assert_eq!(grant, want);
+    }
+
+    #[test]
+    fn clipboard_paste_copies_what_it_can_and_names_the_rest() {
+        let source = Scratch::new();
+        let destination = Scratch::new();
+        let notes = source.0.join("notes.md");
+        std::fs::write(&notes, b"hi").unwrap();
+        std::fs::create_dir_all(source.0.join("assets")).unwrap();
+        std::fs::write(source.0.join("assets").join("a.txt"), b"a").unwrap();
+        let sources = vec![
+            notes.to_string_lossy().to_string(),
+            source.0.join("gone.md").to_string_lossy().to_string(),
+            source.0.join("assets").to_string_lossy().to_string(),
+        ];
+
+        let result = copy_clipboard_items_into(&sources, &destination.0);
+        assert_eq!(result.created.len(), 2);
+        assert_eq!(result.failed.len(), 1);
+        assert!(result.failed[0].contains("gone.md"));
+        assert_eq!(
+            std::fs::read(destination.0.join("notes.md")).unwrap(),
+            b"hi"
+        );
+        assert!(destination.0.join("assets").join("a.txt").is_file());
+
+        // Pasting the same item twice keeps the first copy intact.
+        let again = copy_clipboard_items_into(&sources[..1], &destination.0);
+        assert_eq!(again.created.len(), 1);
+        assert!(again.created[0].path.ends_with("notes copy.md"));
+        assert_eq!(
+            std::fs::read(destination.0.join("notes.md")).unwrap(),
+            b"hi"
+        );
+    }
+
+    /// Regression: duplicate/paste must preserve permission bits — an
+    /// executable script's copy has to stay executable (io::copy alone only
+    /// moves bytes).
+    #[cfg(unix)]
+    #[test]
+    fn copy_preserves_executable_bit() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let source = Scratch::new();
+        let destination = Scratch::new();
+        let script = source.0.join("deploy.sh");
+        std::fs::write(&script, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o750)).unwrap();
+
+        let copied = copy_item_into_dir(&script, false, &destination.0, true).unwrap();
+        let mode = std::fs::metadata(&copied).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o750);
+    }
+
+    #[test]
+    fn failed_directory_copy_leaves_no_destination_and_retry_keeps_its_name() {
+        let source = Scratch::new();
+        let destination = Scratch::new();
+        let directory = source.0.join("assets");
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join("a.txt"), b"a").unwrap();
+        std::fs::write(directory.join("b.txt"), b"b").unwrap();
+
+        let mut copies = 0;
+        let copied = copy_item_into_dir_with(
+            &directory,
+            true,
+            &destination.0,
+            true,
+            &mut |source, destination| {
+                copies += 1;
+                if copies == 2 {
+                    Err("injected copy failure after a completed file".to_string())
+                } else {
+                    std::fs::copy(source, destination).map_err(|error| error.to_string())
+                }
+            },
+        );
+        assert_eq!(copies, 2, "the failure must happen after a real file copy");
+        assert!(copied.unwrap_err().contains("injected copy failure"));
+        assert!(!destination.0.join("assets").exists());
+        assert_eq!(std::fs::read_dir(&destination.0).unwrap().count(), 0);
+
+        let retry = copy_item_into_dir(&directory, true, &destination.0, true).unwrap();
+        assert_eq!(retry, destination.0.join("assets"));
+        assert_eq!(std::fs::read(retry.join("a.txt")).unwrap(), b"a");
+        assert_eq!(std::fs::read(retry.join("b.txt")).unwrap(), b"b");
+    }
+
+    #[test]
+    fn a_file_created_during_copy_is_never_replaced() {
+        let source = Scratch::new();
+        let destination = Scratch::new();
+        let file = source.0.join("notes.md");
+        std::fs::write(&file, b"new copy").unwrap();
+        let mut competing_file = None;
+
+        let copied = copy_item_into_dir_with(
+            &file,
+            false,
+            &destination.0,
+            true,
+            &mut |source, temporary| {
+                let result = std::fs::copy(source, temporary).map_err(|error| error.to_string());
+                let competing = destination.0.join("notes.md");
+                std::fs::write(&competing, b"external").unwrap();
+                competing_file = Some(competing);
+                result
+            },
+        );
+
+        assert!(copied.unwrap_err().contains("rename"));
+        assert_eq!(std::fs::read(competing_file.unwrap()).unwrap(), b"external");
+        assert_eq!(std::fs::read_dir(&destination.0).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn a_directory_created_during_copy_is_never_replaced() {
+        let source = Scratch::new();
+        let destination = Scratch::new();
+        let directory = source.0.join("assets");
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::write(directory.join("copy.txt"), b"copy").unwrap();
+
+        let copied = copy_item_into_dir_with(
+            &directory,
+            true,
+            &destination.0,
+            true,
+            &mut |source, temporary| {
+                let result = std::fs::copy(source, temporary).map_err(|error| error.to_string());
+                std::fs::create_dir(destination.0.join("assets")).unwrap();
+                std::fs::write(
+                    destination.0.join("assets").join("external.txt"),
+                    b"external",
+                )
+                .unwrap();
+                result
+            },
+        );
+
+        assert!(copied.unwrap_err().contains("rename"));
+        assert_eq!(
+            std::fs::read(destination.0.join("assets").join("external.txt")).unwrap(),
+            b"external"
+        );
+        assert!(!destination.0.join("assets").join("copy.txt").exists());
+        assert_eq!(std::fs::read_dir(&destination.0).unwrap().count(), 1);
+    }
+    #[test]
+    fn cleanup_failure_reports_the_staged_item_path() {
+        let scratch = Scratch::new();
+        let directory = scratch.0.join("incomplete");
+        std::fs::create_dir(&directory).unwrap();
+
+        let error = remove_partial_copy(&directory, false, "copy failed".to_string());
+
+        assert!(error.starts_with("copy failed"));
+        assert!(error.contains("partial copy remains at"));
+        assert!(error.contains(&directory.to_string_lossy().to_string()));
+        assert!(directory.is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clipboard_paste_rejects_top_level_file_and_directory_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let source = Scratch::new();
+        let destination = Scratch::new();
+        std::fs::write(source.0.join("target.txt"), b"target").unwrap();
+        std::fs::create_dir(source.0.join("target-dir")).unwrap();
+        symlink(source.0.join("target.txt"), source.0.join("file-link")).unwrap();
+        symlink(source.0.join("target-dir"), source.0.join("dir-link")).unwrap();
+        let sources = ["file-link", "dir-link"]
+            .map(|name| source.0.join(name).to_string_lossy().into_owned());
+
+        let result = copy_clipboard_items_into(&sources, &destination.0);
+
+        assert!(result.created.is_empty());
+        assert_eq!(result.failed.len(), 2);
+        assert!(result.failed.iter().all(|error| error.contains("symlink")));
+        assert_eq!(std::fs::read_dir(&destination.0).unwrap().count(), 0);
+    }
+
+    /// exFAT on macOS answers `RENAME_EXCL` with ENOTSUP: the copy must
+    /// still publish, and still refuse to replace an existing destination.
+    #[cfg(unix)]
+    #[test]
+    fn unsupported_exclusive_rename_falls_back_without_replacing() {
+        let scratch = Scratch::new();
+        let unsupported =
+            |_: &Path, _: &Path| Err(std::io::Error::from_raw_os_error(libc::ENOTSUP));
+        let staged = scratch.0.join(".staged");
+        let destination = scratch.0.join("notes.md");
+        std::fs::write(&staged, b"copy").unwrap();
+
+        publish_copy_with(&staged, &destination, unsupported).unwrap();
+        assert_eq!(std::fs::read(&destination).unwrap(), b"copy");
+        assert!(!staged.exists());
+
+        std::fs::write(&staged, b"second").unwrap();
+        let error = publish_copy_with(&staged, &destination, unsupported).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&destination).unwrap(), b"copy");
+        assert_eq!(std::fs::read(&staged).unwrap(), b"second");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn other_exclusive_rename_errors_do_not_fall_back() {
+        let scratch = Scratch::new();
+        let staged = scratch.0.join(".staged");
+        let destination = scratch.0.join("notes.md");
+        std::fs::write(&staged, b"copy").unwrap();
+
+        let error = publish_copy_with(&staged, &destination, |_, _| {
+            Err(std::io::Error::from_raw_os_error(libc::EACCES))
+        })
+        .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EACCES));
+        assert!(!destination.exists());
+        assert!(staged.exists());
+    }
+
+    /// The staged name must not grow with the source name: a 213-character
+    /// name fits the 255 limit, its staged sibling must too. On Windows the
+    /// temp dir alone makes the full path pass `MAX_PATH`, so this also pins
+    /// that the publication rename handles long paths like `std::fs` does.
+    #[test]
+    fn long_names_paste_and_duplicate() {
+        let source = Scratch::new();
+        let destination = Scratch::new();
+        let name = format!("{}.md", "a".repeat(210));
+        let file = source.0.join(&name);
+        std::fs::write(&file, b"hi").unwrap();
+
+        let pasted = copy_item_into_dir(&file, false, &destination.0, true).unwrap();
+        assert_eq!(pasted, destination.0.join(&name));
+        let duplicated = copy_item_into_dir(&file, false, &source.0, false).unwrap();
+        assert_eq!(std::fs::read(duplicated).unwrap(), b"hi");
+    }
+
+    /// Duplicate/paste keep the modification time like a file-manager copy
+    /// (APFS clone / copyfile on macOS, CopyFileEx on Windows).
+    #[cfg(any(target_os = "macos", windows))]
+    #[test]
+    fn copy_keeps_the_source_modification_time() {
+        let source = Scratch::new();
+        let destination = Scratch::new();
+        let file = source.0.join("photo.txt");
+        std::fs::write(&file, b"data").unwrap();
+        let old = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_577_880_000);
+        std::fs::File::options()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+
+        let copied = copy_item_into_dir(&file, false, &destination.0, true).unwrap();
+        assert_eq!(std::fs::metadata(copied).unwrap().modified().unwrap(), old);
     }
 
     #[test]

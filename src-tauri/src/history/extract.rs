@@ -64,7 +64,7 @@ pub fn scan_summary_file(
         reader,
         &extractor_for(engine, ImageMode::SkipDataUrls),
         accepted_internal_frames,
-        |row| {
+        |_, row| {
             acc.accept(row);
         },
     );
@@ -72,7 +72,12 @@ pub fn scan_summary_file(
 }
 
 /// dsh session files are zstd-compressed NDJSON; everything else is plain.
-fn open_line_reader(engine: &str, path: &Path) -> Result<Box<dyn BufRead>, String> {
+///
+/// dsh 的压缩不是可选项：`Decoder` 默认**跨帧拼接到 EOF**（`single_frame()` 才是
+/// 只读第一帧），而真实转录本的第 1 帧通常只有 header 一行（实测：7.4 MB / 3 887
+/// 帧 / 首帧 216 B）。分叉也要按行读这个文件（`engine::fork_dsh`），所以按 crate
+/// 可见性暴露出去——两处各包一层 zstd 解码必然漂移。
+pub(crate) fn open_line_reader(engine: &str, path: &Path) -> Result<Box<dyn BufRead>, String> {
     let file = std::fs::File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
     if engine == "dsh" {
         let decoder = zstd::stream::read::Decoder::new(std::io::BufReader::new(file))
@@ -85,7 +90,7 @@ fn open_line_reader(engine: &str, path: &Path) -> Result<Box<dyn BufRead>, Strin
 
 /// Image payloads: the reader renders them, the scanner must not build them.
 #[derive(Clone, Copy, PartialEq)]
-enum ImageMode {
+pub(super) enum ImageMode {
     Collect,
     SkipDataUrls,
 }
@@ -190,15 +195,19 @@ fn claude_drop_local_command(value: &Value, open: &mut bool) -> bool {
 
 /// Line-loop skeleton shared by the full parse and the scan summary: decode
 /// one NDJSON line, extract rows, normalize, hand each to `consume`.
+///
+/// `line` 是该行在文件里的行号（0 起），随每条 row 一起交给 `consume`：会话
+/// 分叉要按"锚点轮结束在第几行"复制前缀，行号只有在这一层拿得到（row 一旦
+/// 折进 `Message` 就与源码位置脱钩了）。
 fn walk_lines(
     reader: impl BufRead,
     extract: &LineExtractor<'_>,
     accepted_internal_frames: &HashSet<String>,
-    mut consume: impl FnMut(LineRow),
+    mut consume: impl FnMut(usize, LineRow),
 ) {
-    for line in reader.lines() {
-        let Ok(line) = line else { continue };
-        let trimmed = line.trim();
+    for (line, text) in reader.lines().enumerate() {
+        let Ok(text) = text else { continue };
+        let trimmed = text.trim();
         if trimmed.is_empty() || !trimmed.contains("\"type\"") {
             continue;
         }
@@ -209,9 +218,47 @@ fn walk_lines(
             let Some(row) = normalize_extracted_row(row, accepted_internal_frames) else {
                 continue;
             };
-            consume(row);
+            consume(line, row);
         }
     }
+}
+
+/// 分叉切点用的**用户消息源行号**，按出现顺序排列；最后一个元素是 `usize::MAX`
+/// （文件末尾从不是某条消息的起点）。
+///
+/// 存在的理由：切点只能从**解析器同一条**流水线上推导。另写一份"这条原始记录
+/// 算不算用户消息"的判据必然与提取器分家，于是"第 n 条 user 记录"整体错位，分叉
+/// 静默地少复制 N 轮、甚至只剩 CLI chrome。行号由提取器自己产出，两个口径就不可能
+/// 再分开。
+///
+/// `engine` 是三个引擎共用的同一个入口：凡是走同一份提取器 + `normalize_extracted_row`
+/// 的引擎，计数口径就与 `parse_session_file` 天然一致。**不要**再为某个引擎另写一份
+/// "原始行是否算 user 消息"的判据——Codex 曾经这么做过（直接用 `codex_line_is_visible_user`
+/// 数原始行），结果 `# AGENTS.md instructions` / `<environment_context>` / `<skill>`
+/// 这类会被规范化丢弃的注入行仍被计数，序号比锚点大，切点提前一轮，分支静默丢掉
+/// 用户点的那一轮。
+pub(crate) fn user_row_lines(
+    engine: &str,
+    reader: impl BufRead,
+    accepted_internal_frames: &HashSet<String>,
+) -> Vec<usize> {
+    let mut lines = Vec::new();
+    walk_lines(
+        reader,
+        &extractor_for(engine, ImageMode::Collect),
+        accepted_internal_frames,
+        |line, row| {
+            // 丢弃条件走 `user_row_is_visible`（与 `fold_rows` 同一个函数）：少算或多算
+            // 几条 user 行，"第 n 条 user 记录"就整体错位，分叉会静默切早或切晚一轮。
+            // 两个集合必须由构造保证相同，不能靠"实际数据里不会出现空文本行"。
+            if row.role == "user" && user_row_is_visible(&row.text, !row.images.is_empty()) {
+                lines.push(line);
+            }
+        },
+    );
+    // 末尾哨兵：锚点轮是最后一轮时，切点取它（= 整份文件），分支仍**包含**该轮。
+    lines.push(usize::MAX);
+    lines
 }
 
 fn collect_session(
@@ -220,7 +267,7 @@ fn collect_session(
     accepted_internal_frames: &HashSet<String>,
 ) -> ParsedSession {
     let mut rows = Vec::new();
-    walk_lines(reader, extract, accepted_internal_frames, |row| {
+    walk_lines(reader, extract, accepted_internal_frames, |_, row| {
         rows.push(row)
     });
     fold_rows(rows)
@@ -271,7 +318,7 @@ fn fold_rows(rows: Vec<LineRow>) -> ParsedSession {
                         .rposition(|m| m.role == "tool" && m.result.is_none()),
                 };
                 if let Some(index) = index {
-                    if let Some(todos) = crate::engine::parse_todo_result(&res) {
+                    if let Some(todos) = crate::engine::parse_todo_result(&messages[index].text, &res) {
                         messages[index].todos = Some(todos);
                     }
                     messages[index].result = Some(res);
@@ -279,7 +326,10 @@ fn fold_rows(rows: Vec<LineRow>) -> ParsedSession {
             }
             continue;
         }
-        if row.text.trim().is_empty() && row.images.is_empty() {
+        // Same predicate as the fork cut's `user_row_lines`: a row dropped here
+        // must be dropped there, or "the n-th user message" drifts by a turn.
+        // Hidden agent-status rows are intentionally textless and must survive.
+        if row.role != "__agent_status__" && !user_row_is_visible(&row.text, !row.images.is_empty()) {
             continue;
         }
         let parsed_ts = row.ts.as_deref().and_then(super::parse_ts_ms_str);
@@ -381,6 +431,43 @@ impl ScanAcc {
     }
 }
 
+/// 一条 user 行是否**可见**（会被折叠成 `Message`）：空文本且无图片的行不算。
+///
+/// 这是"可见 user 行"的**唯一一份**定义，三个消费者共用：
+/// 1. `fold_rows`——决定产不产出 `Message`；
+/// 2. `user_row_lines`（Claude 切点）——决定哪些行进"第 n 条 user 记录"的表；
+/// 3. `fork_dsh::keep_count` / `fork_keep_count_codex`——把"锚点是第几条可见 user
+///    消息"映射回"它在哪一轮"。
+///
+/// 前两个必须逐字一致：行表比 `parsed.messages` 多算几条，切点就整体错位。第三个则
+/// 关系到"一轮里不止一条 user 消息"时锚点落到哪一轮——分开写会静默切早或切晚。
+pub(crate) fn user_row_is_visible(text: &str, has_images: bool) -> bool {
+    !(text.trim().is_empty() && !has_images)
+}
+
+/// dsh 的 `user/message` 里**用户真正输入**的文本；注入的运行时上下文与空文本返回
+/// `None`（那一行不算可见 user 消息）。
+///
+/// 这个判据**必须只有一份定义**：提取器（`extract_dsh_line`）用它决定哪一行产出可见
+/// user 消息。分叉切点**不再**单独调用它——切点走 `user_row_lines("dsh", …)`，与解析器
+/// 共用同一条流水线，这样"第几条可见 user 消息"与"第几轮"的口径天然一致（dsh 的一轮里
+/// 可以有多条可见 user 消息，两者本就**不是一回事**）。
+pub(crate) fn dsh_user_message_text(value: &Value) -> Option<String> {
+    if type_str(value) != "user/message" {
+        return None;
+    }
+    let text = content_text(value.get("data").and_then(|d| d.get("content")));
+    // Skip injected runtime context / system reminders — not user text.
+    let trimmed = text.trim();
+    if trimmed.starts_with("<system-reminder>") || trimmed.starts_with("Current runtime context") {
+        return None;
+    }
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(text)
+}
+
 fn extract_dsh_line(value: &Value) -> LineRows {
     let line_type = type_str(value);
     let ts = value
@@ -388,21 +475,10 @@ fn extract_dsh_line(value: &Value) -> LineRows {
         .and_then(Value::as_i64)
         .map(|ms| ms.to_string());
     match line_type {
-        "user/message" => {
-            let text = content_text(value.get("data").and_then(|d| d.get("content")));
-            // Skip injected runtime context / system reminders — not user text.
-            let trimmed = text.trim();
-            if trimmed.starts_with("<system-reminder>")
-                || trimmed.starts_with("Current runtime context")
-            {
-                return Vec::new();
-            }
-            if trimmed.is_empty() {
-                Vec::new()
-            } else {
-                vec![LineRow::new("user", text, ts)]
-            }
-        }
+        "user/message" => match dsh_user_message_text(value) {
+            None => Vec::new(),
+            Some(text) => vec![LineRow::new("user", text, ts)],
+        },
         "assistant/message" => {
             let content = value
                 .get("data")
@@ -422,9 +498,10 @@ fn extract_dsh_line(value: &Value) -> LineRows {
     }
 }
 
-/// Paths embedded by `kimi_prompt_with_images` after the marker block, one
-/// `<image path="...">` tag per attachment.
-fn kimi_image_paths(block: &str) -> Vec<String> {
+/// Paths embedded by `kimi_prompt_with_images`, `minimax_prompt_with_images`,
+/// or `agy_prompt_with_images` after the marker block, one `<image path="...">`
+/// tag per attachment.
+pub(crate) fn embedded_image_paths(block: &str) -> Vec<String> {
     const TAG: &str = "<image path=\"";
     let mut out = Vec::new();
     let mut rest = block;
@@ -814,7 +891,7 @@ fn extract_minimax_line(value: &Value) -> LineRows {
             let (display, images) = match text.find(crate::engine::images::MINIMAX_IMAGE_MARKER) {
                 Some(idx) => (
                     text[..idx].trim_end().to_string(),
-                    kimi_image_paths(&text[idx..]),
+                    embedded_image_paths(&text[idx..]),
                 ),
                 None => (text, Vec::new()),
             };
@@ -980,7 +1057,7 @@ fn extract_codex_line(value: &Value, images: ImageMode) -> LineRows {
                 }
                 _ => Vec::new(),
             };
-            if text.trim().is_empty() && collected.is_empty() {
+            if !user_row_is_visible(&text, !collected.is_empty()) {
                 Vec::new()
             } else {
                 vec![LineRow {
@@ -1052,8 +1129,188 @@ fn pi_assistant_part(part: &Value, out: &mut LineRows, text: &mut String, ts: &O
     }
 }
 
+/// Match the same state vocabulary as the frontend's `agentState`, while
+/// accepting the duration/exit annotations and merge prefix in task summaries.
+fn pi_async_status(status: &str) -> Option<&'static str> {
+    let summary = status.split(['(', '>']).next()?.trim();
+    let mut words = summary.split_whitespace();
+    let first = words.next()?;
+    let state = if first.eq_ignore_ascii_case("merge") { words.next()? } else { first };
+    if words.next().is_some() {
+        return None;
+    }
+    [
+        "active", "in_progress", "pending", "queued", "running", "aborted",
+        "canceled", "cancelled", "complete", "completed", "done", "error",
+        "errored", "failed", "finished", "idle", "killed", "parked", "stopped",
+        "succeeded", "success", "timed_out", "timeout",
+    ].into_iter().find(|known| state.eq_ignore_ascii_case(known))
+}
+
+struct PiAsyncTaskResult<'a> {
+    range: std::ops::Range<usize>,
+    id: Option<&'a str>,
+    status: Option<&'static str>,
+}
+
+/// Only outer result envelopes carry status. A closed envelope discards any
+/// nested examples; output/preview blocks are quoted even if truncated. Bare
+/// opening-tag fragments have no closing envelope proving nesting, so retain
+/// the legacy adjacent-fragment format rather than treating it as a tree.
+fn pi_async_task_results(text: &str) -> Vec<PiAsyncTaskResult<'_>> {
+    static TAG: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r#"<(/?)(task-result|output|preview)\b((?:[^>"']|"[^"]*"|'[^']*')*)>"#).unwrap()
+    });
+    static ATTRIBUTE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        // Consume entire attribute values, including attributes we ignore, so
+        // quoted text such as `agent="example id=Other"` cannot supply an id.
+        regex::Regex::new(r#"(?:^|\s)([^\s=]+)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>]+))"#).unwrap()
+    });
+    let mut results: Vec<PiAsyncTaskResult<'_>> = Vec::new();
+    let mut open: Vec<usize> = Vec::new();
+    let mut quoted_depth = 0usize;
+    for tag in TAG.captures_iter(text) {
+        let closing = &tag[1] == "/";
+        if &tag[2] != "task-result" {
+            if closing {
+                quoted_depth = quoted_depth.saturating_sub(1);
+            } else if !tag[3].trim_end().ends_with('/') {
+                quoted_depth += 1;
+            }
+            continue;
+        }
+        // A sample need not be balanced markup. Even its closing result tags
+        // are opaque until the surrounding output/preview block ends.
+        if quoted_depth != 0 {
+            continue;
+        }
+        if closing {
+            if let Some(index) = open.pop() {
+                results[index].range.end = tag.get(0).unwrap().end();
+                results.truncate(index + 1);
+            }
+            continue;
+        }
+        let index = results.len();
+        let mut result = PiAsyncTaskResult {
+            range: tag.get(0).unwrap().range(),
+            id: None,
+            status: None,
+        };
+        for attribute in ATTRIBUTE.captures_iter(tag.get(3).unwrap().as_str()) {
+            let value = attribute.get(2)
+                .or_else(|| attribute.get(3))
+                .or_else(|| attribute.get(4))
+                .unwrap().as_str().trim();
+            match &attribute[1] {
+                "id" => result.id = (!value.is_empty()).then_some(value),
+                "status" => result.status = pi_async_status(value),
+                _ => {}
+            }
+        }
+        results.push(result);
+        if !tag[3].trim_end().ends_with('/') {
+            open.push(index);
+        }
+    }
+    results
+}
+
+/// Async completions are status snapshots, not user/assistant chat bodies.
+/// Job headers associate each result with its background handle: job-manager
+/// may suffix that handle on collision without changing the actual agent id.
+fn pi_async_result_rows(value: &Value) -> LineRows {
+    static JOB_HEADER: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"(?m)^(?:Background job (\S+) has completed[^\r\n]*|── Job (\S+)(?: \([^\r\n]*\))? ──)[ \t]*\r?$").unwrap()
+    });
+    let mut jobs = value
+        .get("details")
+        .and_then(|details| details.get("jobs"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let scoped = !jobs.is_empty();
+    let text = content_text(value.get("content"));
+    let mut headers = JOB_HEADER.captures_iter(&text).peekable();
+    let mut job_id = None;
+    let mut previous_end = 0;
+    for result in pi_async_task_results(&text) {
+        while headers.peek().is_some_and(|header| header.get(0).unwrap().start() < result.range.start) {
+            let header = headers.next().unwrap();
+            // A result body can quote an entire job delivery, including its
+            // header. It must not change the owner of the next outer result.
+            if header.get(0).unwrap().start() >= previous_end {
+                job_id = header.get(1).or_else(|| header.get(2)).map(|id| id.as_str());
+            }
+        }
+        previous_end = result.range.end;
+        let Some(id) = result.id else { continue };
+        if scoped {
+            // `jobId` is the background handle and may carry a collision
+            // suffix; `agentId` is the real agent identity. Both match a tag,
+            // and the explicit agent identity wins over the handle when no
+            // header disambiguates them.
+            let job = jobs.iter_mut().find(|job| {
+                let identity = job.get("id").and_then(Value::as_str)
+                    .or_else(|| job.get("agentId").and_then(Value::as_str));
+                let handle = job.get("jobId").and_then(Value::as_str);
+                match job_id {
+                    Some(owner) => handle == Some(owner) || identity == Some(owner),
+                    None => identity == Some(id) || handle == Some(id),
+                }
+            });
+            let Some(job) = job.and_then(Value::as_object_mut) else { continue };
+            if job.get("type").and_then(Value::as_str).is_some_and(|kind| kind != "task") {
+                continue;
+            }
+            // An explicit structured agent id is authoritative, just like a
+            // structured status; only a jobId-only row needs identity repair.
+            if job.get("id").is_some_and(|explicit| explicit.as_str() != Some(id)) {
+                continue;
+            }
+            if let Some(agent) = job.get("agentId").and_then(Value::as_str).map(str::to_string) {
+                job.insert("id".into(), Value::String(agent));
+            } else {
+                job.entry("id").or_insert_with(|| Value::String(id.to_string()));
+            }
+            if let Some(status) = result.status {
+                job.entry("status").or_insert_with(|| Value::String(status.to_string()));
+            }
+        } else if let Some(status) = result.status {
+            let mut job = serde_json::json!({"id": id, "type": "task", "status": status});
+            if let Some(job_id) = job_id {
+                job["jobId"] = Value::String(job_id.to_string());
+            }
+            jobs.push(job);
+        }
+    }
+    for job in &mut jobs {
+        let Some(job) = job.as_object_mut() else { continue };
+        if !job.contains_key("id") {
+            // No tag settled this row: the real agent identity is still the
+            // one the panel's dispatch knows, not the suffixed job handle.
+            if let Some(id) = job.get("agentId").or_else(|| job.get("jobId"))
+                .and_then(Value::as_str).map(str::to_string) {
+                job.insert("id".into(), Value::String(id));
+            }
+        }
+    }
+    if jobs.is_empty() {
+        return Vec::new();
+    }
+    vec![LineRow {
+        result: Some(serde_json::json!({"details": {"jobs": jobs}})),
+        ..LineRow::new("__agent_status__", String::new(), ts_string(value, &["timestamp"]))
+    }]
+}
+
 /// pi/omp session lines: {type:"message", timestamp, message:{role, content, usage?}}
 fn extract_pi_family_line(engine: &str, value: &Value, images: ImageMode) -> LineRows {
+    if value.get("type").and_then(Value::as_str) == Some("custom_message")
+        && value.get("customType").and_then(Value::as_str) == Some("async-result")
+    {
+        return pi_async_result_rows(value);
+    }
     if value.get("type").and_then(Value::as_str) != Some("message") {
         return Vec::new();
     }
@@ -1208,12 +1465,23 @@ fn claude_block_rows(
                 path: input.and_then(crate::engine::tool_path_arg),
                 args: input.and_then(crate::engine::parse_tool_args_value),
                 todos: input.and_then(crate::engine::parse_todo_args),
+                // The CLI stamps every call with the id its result comes
+                // back on. Without it `fold_rows` can only guess at the
+                // pairing (latest unanswered row), and parallel calls of
+                // one tool — four `TaskCreate` in a row, say — hand their
+                // results to whichever row happened to be last.
+                tool_call_id: block.get("id").and_then(Value::as_str).map(str::to_string),
                 ..LineRow::new("tool", name, ts.clone())
             });
         }
         Some("tool_result") => {
             let res = block.get("content").cloned();
             out.push(LineRow {
+                tool_call_id: block
+                    .get("tool_use_id")
+                    .or_else(|| block.get("toolUseId"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
                 result: res,
                 ..LineRow::new("__tool_result__", String::new(), ts.clone())
             });
@@ -1496,7 +1764,7 @@ fn extract_kimi_line(value: &Value) -> LineRows {
             let (display, images) = match text.find(crate::engine::images::KIMI_IMAGE_MARKER) {
                 Some(idx) => (
                     text[..idx].trim_end().to_string(),
-                    kimi_image_paths(&text[idx..]),
+                    embedded_image_paths(&text[idx..]),
                 ),
                 None => (text, Vec::new()),
             };
@@ -2206,6 +2474,339 @@ mod tests {
         assert_eq!(rows[3].path, None);
     }
 
+    #[test]
+    fn pi_async_results_preserve_structured_status_and_scope_tag_fallbacks() {
+        let line = serde_json::json!({
+            "type": "custom_message",
+            "customType": "async-result",
+            "timestamp": "2026-10-28T10:00:01Z",
+            "content": [{"type": "text", "text": concat!(
+                "<task-result id=\"Reviewer\" status=\"failed (exit 1)\">stale</task-result>",
+                "<task-result id=\"TagOnly\" agent=\"reviewer\" status=\"failed (exit 1)\" duration=\"9m22s\">",
+                "quoted <task-result id=\"OtherJob\" status=\"completed\">unrelated</task-result>",
+                "</task-result>"
+            )}],
+            "details": {"jobs": [
+                {"jobId": "bg_2", "type": "bash", "status": "completed", "label": "Build"},
+                {"jobId": "Reviewer", "type": "task", "status": "running", "label": "Review"},
+                {"jobId": "TagOnly", "type": "task", "label": "Late result"}
+            ]}
+        });
+        for engine in ["pi", "omp"] {
+            let parsed = fold_rows(extract_line_messages(engine, &line, ImageMode::Collect));
+            assert_eq!(parsed.messages.len(), 1, "{engine}");
+            let row = &parsed.messages[0];
+            assert_eq!(row.role, "__agent_status__");
+            assert!(row.text.is_empty());
+            assert_eq!(row.seq, 1);
+            assert_eq!(row.ts.as_deref(), Some("2026-10-28T10:00:01Z"));
+            let jobs = row.result.as_ref().unwrap()["details"]["jobs"].as_array().unwrap();
+            assert_eq!(jobs.len(), 3);
+            assert_eq!(jobs[0]["id"], "bg_2");
+            assert_eq!(jobs[0]["status"], "completed");
+            assert_eq!(jobs[0]["type"], "bash");
+            assert_eq!(jobs[1]["id"], "Reviewer");
+            assert_eq!(jobs[1]["status"], "running");
+            assert_eq!(jobs[1]["label"], "Review");
+            assert_eq!(jobs[2]["id"], "TagOnly");
+            assert_eq!(jobs[2]["status"], "failed");
+            assert!(jobs.iter().all(|job| job["id"] != "OtherJob"));
+        }
+    }
+
+    #[test]
+    fn pi_async_results_match_a_tag_through_the_agent_identity() {
+        // omp suffixes the background handle on collision (`Worker-2`) but the
+        // agent it belongs to is still `Worker`; a tag names the agent.
+        let line = serde_json::json!({
+            "type": "custom_message",
+            "customType": "async-result",
+            "content": [{"type": "text", "text": concat!(
+                "<task-result id=\"Worker\" status=\"completed\">done</task-result>"
+            )}],
+            "details": {"jobs": [
+                {"jobId": "Worker-2", "agentId": "Worker", "type": "task"}
+            ]}
+        });
+        let parsed = fold_rows(extract_line_messages("omp", &line, ImageMode::Collect));
+        let jobs = parsed.messages[0].result.as_ref().unwrap()["details"]["jobs"]
+            .as_array().unwrap();
+        assert_eq!(jobs[0]["id"], "Worker");
+        assert_eq!(jobs[0]["status"], "completed");
+    }
+
+    #[test]
+    fn pi_async_results_prefer_agent_identity_when_no_tag_matches() {
+        let line = serde_json::json!({
+            "type": "custom_message",
+            "customType": "async-result",
+            "content": [],
+            "details": {"jobs": [
+                {"jobId": "Worker-2", "agentId": "Worker", "type": "task", "status": "completed"}
+            ]}
+        });
+        let parsed = fold_rows(extract_line_messages("omp", &line, ImageMode::Collect));
+        let jobs = parsed.messages[0].result.as_ref().unwrap()["details"]["jobs"]
+            .as_array().unwrap();
+        assert_eq!(jobs[0]["id"], "Worker");
+        assert_eq!(jobs[0]["status"], "completed");
+    }
+
+    #[test]
+    fn pi_async_results_accept_all_tags_when_job_entries_are_absent() {
+        for details in [serde_json::json!({}), serde_json::json!({"jobs": []})] {
+            let line = serde_json::json!({
+                "type": "custom_message",
+                "customType": "async-result",
+                "content": concat!(
+                    "<task-result status='failed (exit 1)' id='First'>failed</task-result>",
+                    "<task-result id=\"Second\" status=\"completed\">done</task-result>"
+                ),
+                "details": details
+            });
+            let parsed = fold_rows(extract_pi_family_line("omp", &line, ImageMode::Collect));
+            assert_eq!(parsed.messages.len(), 1);
+            let jobs = &parsed.messages[0].result.as_ref().unwrap()["details"]["jobs"];
+            assert_eq!(jobs.as_array().unwrap().len(), 2);
+            assert_eq!(jobs[0]["id"], "First");
+            assert_eq!(jobs[0]["status"], "failed");
+            assert_eq!(jobs[1]["id"], "Second");
+            assert_eq!(jobs[1]["status"], "completed");
+        }
+    }
+
+    #[test]
+    fn pi_async_results_parse_bare_and_quoted_attributes() {
+        let line = serde_json::json!({
+            "type": "custom_message",
+            "customType": "async-result",
+            "content": [{"type": "text", "text": concat!(
+                "<task-result id=Bare status=completed>",
+                "<task-result id=\"Quoted\" status=\"failed > 1m (exit 2)\">",
+                "<task-result id=\"Merged\" status=\"merge failed\">"
+            )}],
+            "details": {"jobs": []}
+        });
+        let parsed = fold_rows(extract_pi_family_line("omp", &line, ImageMode::Collect));
+        assert_eq!(parsed.messages.len(), 1);
+        let jobs = parsed.messages[0].result.as_ref().unwrap()["details"]["jobs"].as_array().unwrap();
+        assert_eq!(jobs.len(), 3);
+        assert_eq!(jobs[0]["id"], "Bare");
+        assert_eq!(jobs[0]["status"], "completed");
+        assert_eq!(jobs[1]["id"], "Quoted");
+        assert_eq!(jobs[1]["status"], "failed");
+        // `merge failed` is a state *phrase*: the leading word is not a state.
+        assert_eq!(jobs[2]["id"], "Merged");
+        assert_eq!(jobs[2]["status"], "failed");
+    }
+
+    #[test]
+    fn pi_async_results_resolve_single_job_handle_collisions() {
+        for status in [None, Some("running"), Some("unrecognized")] {
+            let mut job = serde_json::json!({"jobId": "bg_1-2", "type": "task", "label": "Collision"});
+            if let Some(status) = status {
+                job["status"] = serde_json::json!(status);
+            }
+            let line = serde_json::json!({
+                "type": "custom_message", "customType": "async-result",
+                "content": concat!(
+                    "Background job bg_1-2 has completed\n\n",
+                    "<task-result id=\"bg_1\" status=\"completed\"><output>done</output></task-result>"
+                ),
+                "details": {"jobs": [job]}
+            });
+            let parsed = fold_rows(extract_pi_family_line("omp", &line, ImageMode::Collect));
+            let jobs = parsed.messages[0].result.as_ref().unwrap()["details"]["jobs"].as_array().unwrap();
+            assert_eq!(jobs.len(), 1);
+            assert_eq!(jobs[0]["jobId"], "bg_1-2");
+            assert_eq!(jobs[0]["id"], "bg_1");
+            assert_eq!(jobs[0]["status"], status.unwrap_or("completed"));
+            assert_eq!(jobs[0]["label"], "Collision");
+        }
+    }
+
+    #[test]
+    fn pi_async_results_match_batch_headers_not_tag_or_job_order() {
+        let line = serde_json::json!({
+            "type": "custom_message", "customType": "async-result",
+            "content": concat!(
+                "── Job Unlisted (not in this delivery) ──\n",
+                "<task-result id=\"Waiting\" status=\"completed\">unrelated</task-result>\n",
+                "── Job bg_1-2 (Collision) ──\n",
+                "<task-result id=\"bg_1\" status=\"completed\"><output>\n",
+                "── Job Real-2 (quoted header) ──\n",
+                "<task-result id=\"Real-2\" status=\"running\">example</task-result>\n",
+                "</output></task-result>\n",
+                "── Job Build ──\n",
+                "<task-result id=\"NotAnAgent\" status=\"failed\">shell output</task-result>\n",
+                "── Job Real-2 ──\n",
+                "<task-result id=\"Real-2\" status=\"failed (exit 2)\">failed</task-result>"
+            ),
+            "details": {"jobs": [
+                {"jobId": "Real-2", "type": "task"},
+                {"jobId": "Waiting", "type": "task"},
+                {"jobId": "Build", "type": "bash", "status": "completed"},
+                {"jobId": "bg_1-2", "type": "task"}
+            ]}
+        });
+        let parsed = fold_rows(extract_pi_family_line("omp", &line, ImageMode::Collect));
+        let jobs = parsed.messages[0].result.as_ref().unwrap()["details"]["jobs"].as_array().unwrap();
+        assert_eq!(jobs.len(), 4);
+        assert_eq!(jobs[0]["jobId"], "Real-2");
+        assert_eq!(jobs[0]["id"], "Real-2");
+        assert_eq!(jobs[0]["status"], "failed");
+        assert_eq!(jobs[1]["id"], "Waiting");
+        assert!(jobs[1].get("status").is_none());
+        assert_eq!(jobs[2]["id"], "Build");
+        assert_eq!(jobs[2]["status"], "completed");
+        assert_eq!(jobs[2]["type"], "bash");
+        assert_eq!(jobs[3]["jobId"], "bg_1-2");
+        assert_eq!(jobs[3]["id"], "bg_1");
+        assert_eq!(jobs[3]["status"], "completed");
+    }
+
+    #[test]
+    fn pi_async_results_do_not_take_same_batch_status_from_nested_examples() {
+        let balanced = "<task-result id=\"B\" status=\"running\">example</task-result>";
+        let bare = "<task-result id=\"B\" status=\"running\">";
+        for (wrapper, sample) in [
+            ("output", balanced), ("preview", balanced), ("", balanced),
+            ("output", bare), ("preview", bare),
+        ] {
+            for details in [None, Some(serde_json::json!({"jobs": [
+                {"jobId": "A", "type": "task"},
+                {"jobId": "B", "type": "task"}
+            ]}))] {
+                let quoted = if wrapper.is_empty() {
+                    sample.to_string()
+                } else {
+                    format!("<{wrapper}>{sample}</{wrapper}>")
+                };
+                let mut line = serde_json::json!({
+                    "type": "custom_message", "customType": "async-result",
+                    "content": format!(
+                        "<task-result id=\"A\" status=\"completed\">{quoted}</task-result>\n\
+                         <task-result id=\"B\" status=\"completed\">done</task-result>"
+                    )
+                });
+                if let Some(details) = details {
+                    line["details"] = details;
+                }
+                let parsed = fold_rows(extract_pi_family_line("omp", &line, ImageMode::Collect));
+                let jobs = parsed.messages[0].result.as_ref().unwrap()["details"]["jobs"].as_array().unwrap();
+                assert_eq!(jobs.len(), 2, "{wrapper}");
+                assert_eq!(jobs[0]["id"], "A");
+                assert_eq!(jobs[0]["status"], "completed");
+                assert_eq!(jobs[1]["id"], "B");
+                assert_eq!(jobs[1]["status"], "completed");
+            }
+        }
+    }
+
+    #[test]
+    fn pi_async_results_normalize_only_known_state_phrases() {
+        for state in [
+            "active", "in_progress", "pending", "queued", "running", "aborted",
+            "canceled", "cancelled", "complete", "completed", "done", "error",
+            "errored", "failed", "finished", "idle", "killed", "parked", "stopped",
+            "succeeded", "success", "timed_out", "timeout",
+        ] {
+            assert_eq!(pi_async_status(state), Some(state));
+        }
+        for (phrase, expected) in [
+            ("failed > 1m (exit 2)", "failed"),
+            ("merge failed", "failed"),
+            ("running > 1m", "running"),
+            (" COMPLETED (2s) ", "completed"),
+        ] {
+            let line = serde_json::json!({
+                "type": "custom_message", "customType": "async-result",
+                "content": format!("<task-result id='Agent' status='{phrase}'>result</task-result>")
+            });
+            let rows = extract_pi_family_line("omp", &line, ImageMode::Collect);
+            assert_eq!(rows[0].result.as_ref().unwrap()["details"]["jobs"][0]["status"], expected);
+        }
+        for unknown in ["", "unrecognized", "not completed", "almost done", "merge unknown", "1m"] {
+            assert_eq!(pi_async_status(unknown), None);
+            let line = serde_json::json!({
+                "type": "custom_message", "customType": "async-result",
+                "content": format!("<task-result id='Agent' status='{unknown}'>result</task-result>")
+            });
+            assert!(extract_pi_family_line("omp", &line, ImageMode::Collect).is_empty());
+        }
+    }
+
+    #[test]
+    fn pi_async_results_ignore_empty_and_damaged_lines() {
+        let damaged = serde_json::json!({
+            "type": "custom_message", "customType": "async-result",
+            "content": "<task-result id='Broken' status='completed'"
+        });
+        let valid = serde_json::json!({
+            "type": "custom_message", "customType": "async-result",
+            "content": "<task-result id='Agent' status='completed'>done</task-result>"
+        });
+        let input = format!("\nnot json\nnull\n{{}}\n{damaged}\n\n{valid}\n");
+        let extractor: LineExtractor<'_> =
+            Box::new(|value| extract_pi_family_line("omp", value, ImageMode::Collect));
+        let parsed = collect_session(std::io::Cursor::new(input), &extractor, &HashSet::new());
+        assert_eq!(parsed.messages.len(), 1);
+        assert_eq!(parsed.messages[0].role, "__agent_status__");
+        assert_eq!(parsed.messages[0].seq, 1);
+        assert_eq!(parsed.messages[0].result.as_ref().unwrap()["details"]["jobs"][0]["id"], "Agent");
+    }
+
+    #[test]
+    fn pi_async_results_keep_structured_jobs_without_content() {
+        // Some deliveries carry the jobs payload with an empty body. The
+        // structured status is the notification; dropping the row would leave
+        // the subagent pill running forever.
+        let line = serde_json::json!({
+            "type": "custom_message", "customType": "async-result", "timestamp": 1_761_000_000_000i64,
+            "content": "", "details": {"jobs": [
+                {"jobId": "Worker-2", "agentId": "Worker", "type": "task", "status": "completed"}
+            ]}
+        });
+        let rows = extract_pi_family_line("omp", &line, ImageMode::Collect);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].role, "__agent_status__");
+        let job = &rows[0].result.as_ref().unwrap()["details"]["jobs"][0];
+        assert_eq!(job["id"], "Worker");
+        assert_eq!(job["jobId"], "Worker-2");
+        assert_eq!(job["status"], "completed");
+    }
+
+    #[test]
+    fn pi_async_status_does_not_consume_tool_results_or_chat_timestamps() {
+        let lines = [
+            serde_json::json!({"type": "message", "timestamp": "2026-10-28T10:00:00Z",
+                "message": {"role": "user", "content": "Run the task"}}),
+            serde_json::json!({"type": "message", "message": {"role": "assistant", "content": [
+                {"type": "toolCall", "id": "dispatch", "name": "task", "arguments": {}}
+            ]}}),
+            serde_json::json!({"type": "custom_message", "customType": "async-result",
+                "timestamp": "2026-10-28T10:00:01Z", "details": {"jobs": [
+                    {"id": "Worker", "status": "completed"}
+                ]}}),
+            serde_json::json!({"type": "message", "message": {"role": "toolResult",
+                "toolCallId": "dispatch", "content": "Spawned"}}),
+            serde_json::json!({"type": "message", "timestamp": "2026-10-28T10:00:02Z",
+                "message": {"role": "assistant", "content": "Done"}}),
+        ];
+        let input = lines.iter().map(Value::to_string).collect::<Vec<_>>().join("\n");
+        let extractor: LineExtractor<'_> =
+            Box::new(|value| extract_pi_family_line("omp", value, ImageMode::Collect));
+        let parsed = collect_session(std::io::Cursor::new(input), &extractor, &HashSet::new());
+        assert_eq!(parsed.messages.len(), 4);
+        assert_eq!(parsed.messages[1].result, Some(serde_json::json!("Spawned")));
+        assert_eq!(parsed.messages[2].role, "__agent_status__");
+        assert_eq!(parsed.messages[3].duration_ms, Some(2000));
+        assert_eq!(parsed.messages[3].seq, 4);
+        let unrelated = serde_json::json!({"type": "custom_message", "customType": "notice",
+            "details": {"jobs": [{"id": "Worker", "status": "completed"}]}});
+        assert!(extract_pi_family_line("omp", &unrelated, ImageMode::Collect).is_empty());
+    }
+
     /// Results pair with their call by id, not by arrival order: parallel tool
     /// calls finish in whatever order they finish, and the fallback (attach to
     /// the latest row still without a result) mislabels them when they do.
@@ -2376,6 +2977,101 @@ mod tests {
         assert_eq!(todos.items[1].content, "write code");
     }
 
+    /// A batch of parallel TaskCreate calls
+    /// settles by id. Pairing on "the latest unanswered row" instead hands
+    /// every result to the last call of the batch, which is what left the
+    /// run-status task list stuck on "pending".
+    #[test]
+    fn claude_parallel_tool_results_pair_with_their_call_ids() {
+        let call = |id: &str, subject: &str| {
+            serde_json::json!({
+                "type": "assistant", "timestamp": "2026-10-21T08:10:10Z",
+                "message": {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": id, "name": "TaskCreate",
+                     "input": {"subject": subject, "description": "", "activeForm": subject}}
+                ]}
+            })
+        };
+        let result = |call_id: &str, text: &str| {
+            serde_json::json!({
+                "type": "user", "timestamp": "2026-10-21T08:10:11Z",
+                "message": {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": call_id, "content": text}
+                ]}
+            })
+        };
+        let lines = vec![
+            call("call-a", "实测 Python 版"),
+            call("call-b", "打包 exe"),
+            // Results arrive in completion order, not call order.
+            result("call-b", "Task #2 created successfully: 打包 exe"),
+            result("call-a", "Task #1 created successfully: 实测 Python 版"),
+        ];
+        let input = lines
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let extractor: LineExtractor<'_> =
+            Box::new(|value: &Value| extract_claude_line(value, ImageMode::Collect));
+        let parsed = collect_session(std::io::Cursor::new(input), &extractor, &HashSet::new());
+
+        assert_eq!(parsed.messages.len(), 2);
+        let (first, second) = (&parsed.messages[0], &parsed.messages[1]);
+        assert_eq!(first.text, "TaskCreate");
+        assert_eq!(first.result, Some(serde_json::json!("Task #1 created successfully: 实测 Python 版")));
+        assert_eq!(second.result, Some(serde_json::json!("Task #2 created successfully: 打包 exe")));
+        // The result also teaches the row the id every later TaskUpdate names.
+        let first_todos = first.todos.as_ref().expect("create payload");
+        assert_eq!(first_todos.items[0].id.as_deref(), Some("1"));
+        let second_todos = second.todos.as_ref().expect("create payload");
+        assert_eq!(second_todos.items[0].id.as_deref(), Some("2"));
+    }
+
+    /// Reading a task back (TaskGet) is not an update: its row carries no todo
+    /// patch, so replaying history cannot reset a finished task to pending.
+    #[test]
+    fn claude_task_get_row_carries_no_todo_patch() {
+        let call = |id: &str, name: &str, input: Value| {
+            serde_json::json!({
+                "type": "assistant", "timestamp": "2026-10-21T08:10:10Z",
+                "message": {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": id, "name": name, "input": input}
+                ]}
+            })
+        };
+        let result = |call_id: &str, text: &str| {
+            serde_json::json!({
+                "type": "user", "timestamp": "2026-10-21T08:10:11Z",
+                "message": {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": call_id, "content": text}
+                ]}
+            })
+        };
+        let lines = vec![
+            call("call-c", "TaskCreate", serde_json::json!({"subject": "A", "description": ""})),
+            result("call-c", "Task #1 created successfully: A"),
+            call("call-u", "TaskUpdate", serde_json::json!({"taskId": "1", "status": "completed"})),
+            result("call-u", "Updated task #1 status"),
+            call("call-g", "TaskGet", serde_json::json!({"taskId": "1"})),
+            result("call-g", "Task #1: A\nStatus: completed\nDescription: "),
+        ];
+        let input = lines
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let extractor: LineExtractor<'_> =
+            Box::new(|value: &Value| extract_claude_line(value, ImageMode::Collect));
+        let parsed = collect_session(std::io::Cursor::new(input), &extractor, &HashSet::new());
+
+        assert_eq!(parsed.messages.len(), 3);
+        assert_eq!(parsed.messages[0].todos.as_ref().unwrap().items[0].id.as_deref(), Some("1"));
+        assert_eq!(parsed.messages[1].todos.as_ref().unwrap().items[0].status, "complete");
+        assert_eq!(parsed.messages[2].text, "TaskGet");
+        assert!(parsed.messages[2].todos.is_none());
+    }
+
     #[test]
     fn claude_line_drops_is_meta_command_expansion() {
         let expansion: Value = serde_json::json!({
@@ -2452,7 +3148,7 @@ mod tests {
             std::io::Cursor::new(input),
             &extractor_for("claude", ImageMode::SkipDataUrls),
             &HashSet::new(),
-            |row| acc.accept(row),
+            |_, row| acc.accept(row),
         );
         assert_eq!(acc.finish().title, "review下本地代码");
     }
@@ -2463,6 +3159,80 @@ mod tests {
         assert_eq!(
             claude_texts(&[claude_user(text, false)]),
             ["/aimax:code-review 审查1772"]
+        );
+    }
+
+    /// 分叉切点用的「可见 user 行号」必须与提取器同源：列出的行号就是
+    /// `parse_session_file` 里那些 user 消息所在的原始行，末尾再加一个"文件
+    /// 末尾"哨兵。会话分叉整条链路都压在这上面（切点 = 第 n+1 条可见 user 行），
+    /// 所以把每种形状钉在确切行号上：CLI chrome（caveat / 窗内信封 / stdout）、
+    /// 工具结果轮、`isMeta` 展开都不占行号；真实提问、窗外的 skill 信封、纯图片轮
+    /// 各占一行。行号一旦与解析口径分家，分叉就会静默少复制若干轮。
+    #[test]
+    fn claude_user_row_lines_match_the_visible_rows() {
+        let caveat = "<local-command-caveat>Caveat: local command.</local-command-caveat>";
+        let model = "<command-name>/model</command-name>\n<command-message>model</command-message>\n<command-args></command-args>";
+        let skill = "<command-message>aimax:code-review</command-message>\n<command-name>/aimax:code-review</command-name>\n<command-args>审查1772</command-args>";
+        let image = serde_json::json!({
+            "type": "user",
+            "message": {
+                "role": "user",
+                "content": [
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "aGk="}}
+                ]
+            }
+        });
+        let tool_result = serde_json::json!({
+            "type": "user",
+            "message": {"role": "user", "content": [{"type": "tool_result", "content": "输出"}]}
+        });
+        let lines = vec![
+            claude_user(caveat, true),  // 0 CLI chrome：开窗
+            claude_user(model, false),  // 1 CLI chrome：窗内信封
+            claude_user(
+                "<local-command-stdout>Set model to Opus</local-command-stdout>",
+                false,
+            ), // 2 CLI chrome：stdout
+            claude_user("先看一眼仓库结构", false), // 3 可见（同时关掉上面的窗口）
+            tool_result,                // 4 工具结果轮：不占行号
+            claude_user(skill, false),  // 5 可见：窗口已关，信封按 `命令 参数` 显示
+            claude_user("被展开的命令", true), // 6 isMeta 展开：不占行号
+            image,                      // 7 可见：纯图片轮（文本为空）
+            claude_user("你能干啥", false), // 8 可见
+        ];
+        let input = lines
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let cursor = || std::io::Cursor::new(input.clone());
+        assert_eq!(
+            user_row_lines("claude", cursor(), &HashSet::new()),
+            [3, 5, 7, 8, usize::MAX],
+            "可见 user 行的行号（0 起）+ 末尾哨兵"
+        );
+        // 与解析同源：去掉哨兵后的条数必须等于解析出的 user 消息数。
+        let parsed = collect_session(
+            cursor(),
+            &extractor_for("claude", ImageMode::Collect),
+            &HashSet::new(),
+        );
+        let texts: Vec<String> = parsed
+            .messages
+            .iter()
+            .filter(|m| m.role == "user")
+            .map(|m| m.text.clone())
+            .collect();
+        assert_eq!(
+            texts,
+            [
+                "先看一眼仓库结构",
+                "/aimax:code-review 审查1772",
+                "",
+                "你能干啥"
+            ],
+            "行号表与解析结果必须是同一批 user 轮"
         );
     }
 

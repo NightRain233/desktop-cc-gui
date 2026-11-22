@@ -538,18 +538,117 @@ fn qoder_encode_project_slug(path: &str) -> String {
     value.replace(['/', ':'], "-")
 }
 
+/// qodercli replaces non-ASCII-alphanumeric UTF-16 units with dashes.
+fn qoder_cli_project_slug(path: &str) -> String {
+    const PREFIX_LEN: usize = 200;
+    let mut slug = String::new();
+    let mut hash = 5381_i32;
+    for unit in path.encode_utf16() {
+        let ascii = u8::try_from(unit).ok().filter(u8::is_ascii_alphanumeric);
+        slug.push(ascii.map_or('-', char::from));
+        hash = hash.wrapping_mul(33) ^ i32::from(unit);
+    }
+    if slug.len() > PREFIX_LEN {
+        slug.truncate(PREFIX_LEN);
+        let mut hash = hash.unsigned_abs();
+        let mut suffix = Vec::new();
+        loop {
+            suffix.push(char::from_digit(hash % 36, 36).expect("base36 digit"));
+            hash /= 36;
+            if hash == 0 {
+                break;
+            }
+        }
+        slug.push('-');
+        slug.extend(suffix.into_iter().rev());
+    }
+    slug
+}
+
+struct CachedQoderCwd {
+    signature: (u64, std::time::SystemTime),
+    cwd: Option<String>,
+}
+
+static QODER_CWD_CACHE: std::sync::LazyLock<
+    parking_lot::Mutex<std::collections::HashMap<PathBuf, CachedQoderCwd>>,
+> = std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
+
+fn read_qoder_transcript_cwd(path: &Path, bucket: &str) -> Option<String> {
+    const HEAD_LINES: usize = 64;
+    // Use the first cwd consistent with the containing directory. Later
+    // turns can record another cwd (for example after entering a worktree).
+    // The shared head reader bounds both lines and bytes.
+    try_peek_head_json_lines(path, false, HEAD_LINES)
+        .ok()?
+        .into_iter()
+        .find_map(|line| {
+            let cwd = line.get("cwd")?.as_str()?;
+            (!cwd.is_empty()
+                && (qoder_cli_project_slug(cwd) == bucket || qoder_encode_project_slug(cwd) == bucket))
+                .then(|| cwd.to_owned())
+        })
+}
+
+fn qoder_transcript_cwd(path: &Path, bucket: &str, metadata: &std::fs::Metadata) -> Option<String> {
+    const CACHE_CAPACITY: usize = 4096;
+    let signature = metadata
+        .modified()
+        .ok()
+        .map(|mtime| (metadata.len(), mtime));
+    if let Some(signature) = signature {
+        if let Some(cached) = QODER_CWD_CACHE.lock().get(path) {
+            if cached.signature == signature {
+                return cached.cwd.clone();
+            }
+        }
+    }
+    let cwd = read_qoder_transcript_cwd(path, bucket);
+    if let Some(signature) = signature {
+        let mut cache = QODER_CWD_CACHE.lock();
+        if cache.len() >= CACHE_CAPACITY && !cache.contains_key(path) {
+            cache.clear();
+        }
+        cache.insert(
+            path.to_path_buf(),
+            CachedQoderCwd {
+                signature,
+                cwd: cwd.clone(),
+            },
+        );
+    }
+    cwd
+}
+
 /// Candidate `<projects>/<slug>` dirs for one workspace — same spelling
 /// spread as [`claude_project_dirs`] (raw / trailing-trimmed / canonical).
-fn qoder_project_dirs(base: &Path, workspace: &Path) -> Vec<PathBuf> {
+/// `cli_encoded` marks the lossy qodercli namespace, where a transcript
+/// without a usable cwd must not be assigned by directory name alone.
+#[derive(Debug)]
+struct QoderProjectDir {
+    path: PathBuf,
+    cli_encoded: bool,
+}
+
+fn qoder_project_dirs(base: &Path, workspace: &Path) -> Vec<QoderProjectDir> {
     fn push(
-        out: &mut Vec<PathBuf>,
+        out: &mut Vec<QoderProjectDir>,
         seen: &mut std::collections::HashSet<String>,
         base: &Path,
         spelling: &str,
     ) {
-        let slug = qoder_encode_project_slug(spelling);
-        if !slug.is_empty() && seen.insert(slug.clone()) {
-            out.push(base.join(slug));
+        // Qoder also uses ASCII-sanitized project names (notably for Chinese
+        // and spaces). Prefer that spelling while retaining legacy dirs.
+        for (slug, cli_encoded) in [
+            (qoder_cli_project_slug(spelling), true),
+            (qoder_encode_project_slug(spelling), false),
+        ] {
+            if !slug.is_empty() && seen.insert(slug.clone()) {
+                out.push(QoderProjectDir {
+                    path: base.join(slug),
+                    cli_encoded,
+                });
+            }
         }
     }
     let mut out = Vec::new();
@@ -567,10 +666,23 @@ fn qoder_project_dirs(base: &Path, workspace: &Path) -> Vec<PathBuf> {
     out
 }
 
+fn qoder_cwd_matches_workspace(
+    cwd: &str,
+    workspace: &Path,
+    canonical_workspace: Option<&Path>,
+) -> bool {
+    let cwd = Path::new(cwd);
+    cwd == workspace
+        || canonical_workspace.is_some_and(|canonical| {
+            std::fs::canonicalize(cwd).is_ok_and(|resolved| resolved == canonical)
+        })
+}
+
 /// Qoder sessions: `<config-home>/projects/<cwd-slug>/<sessionId>.jsonl`, one
 /// claude-shaped NDJSON file per session (reference qoder_history.rs). Each
 /// distribution (Global `~/.qoder` / CN `~/.qoder-cn`) owns an independent
-/// home. Slug-keyed per workspace, so discovery is a handful of readdirs.
+/// home. Directory candidates narrow the scan; the transcript cwd resolves
+/// collisions before session IDs are deduplicated.
 pub(super) fn discover_qoder(
     workspace: &Path,
     distribution: crate::engine::qoder::QoderDistribution,
@@ -579,8 +691,12 @@ pub(super) fn discover_qoder(
         crate::engine::engine_home(None, distribution.default_config_dir_name()).join("projects");
     let mut out = Vec::new();
     let mut seen_sessions = std::collections::HashSet::new();
+    let canonical_workspace = std::fs::canonicalize(workspace).ok();
     for dir in qoder_project_dirs(&base, workspace) {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
+        let Some(bucket) = dir.path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let Ok(entries) = std::fs::read_dir(&dir.path) else {
             continue;
         };
         for entry in entries.flatten() {
@@ -591,6 +707,28 @@ pub(super) fn discover_qoder(
             let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
                 continue;
             };
+            let Ok(metadata) = std::fs::metadata(&path) else {
+                continue;
+            };
+            if !metadata.is_file() {
+                continue;
+            }
+            match qoder_transcript_cwd(&path, bucket, &metadata) {
+                Some(cwd)
+                    if !qoder_cwd_matches_workspace(
+                        &cwd,
+                        workspace,
+                        canonical_workspace.as_deref(),
+                    ) =>
+                {
+                    continue;
+                }
+                // A lossy CLI bucket can contain sessions from several
+                // workspaces. Without a matching cwd there is no safe way to
+                // choose one; retain the old fallback only for legacy dirs.
+                None if dir.cli_encoded => continue,
+                _ => {}
+            }
             if !seen_sessions.insert(stem.to_string()) {
                 continue;
             }
@@ -603,6 +741,39 @@ pub(super) fn discover_qoder(
         }
     }
     out
+}
+
+/// True only when a readable transcript positively identifies another
+/// workspace. Unknown or unreadable ownership stays conservative during GC.
+pub(super) fn qoder_transcript_conflicts_with_workspace(path: &Path, workspace: &Path) -> bool {
+    let Some(bucket) = path
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str())
+    else {
+        return false;
+    };
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    let canonical_workspace = std::fs::canonicalize(workspace).ok();
+    // A destructive GC decision must not depend on a cached head if the file
+    // was replaced while preserving its size and mtime.
+    read_qoder_transcript_cwd(path, bucket).is_some_and(|cwd| {
+        if Path::new(&cwd) == workspace {
+            return false;
+        }
+        // A dangling symlink or detached volume makes canonicalization fail.
+        // Without it, a spelling difference is not positive evidence that the
+        // transcript belongs elsewhere; preserve the user's indexed metadata.
+        let Some(canonical) = canonical_workspace.as_deref() else {
+            return false;
+        };
+        !qoder_cwd_matches_workspace(&cwd, workspace, Some(canonical))
+    })
 }
 
 /// OpenCode data roots holding `storage/{session,message,part}/…` and
@@ -695,7 +866,12 @@ pub(super) fn opencode_db_visible_sessions(
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
     )
     .ok()?;
-    let filter = opencode_visible_filter(&conn);
+    let mut filter = opencode_visible_filter(&conn);
+    // Discovery lists only unarchived rows; an archived one indexed earlier
+    // must leave the sidebar too.
+    if sqlite_has(&conn, "SELECT 1 FROM pragma_table_info('session') WHERE name='time_archived'") {
+        filter.insert_str(0, " AND time_archived IS NULL");
+    }
     let mut visible = std::collections::HashSet::new();
     // Chunk to stay well under SQLite's bound-variable limit.
     for chunk in session_ids.chunks(200) {
@@ -725,10 +901,76 @@ pub(super) fn discover_opencode(workspace: &Path) -> Vec<SessionFile> {
     let mut out = Vec::new();
     let mut seen_sessions = std::collections::HashSet::new();
     for root in opencode_data_roots(workspace) {
-        discover_opencode_tree(&root, workspace, &mut seen_sessions, &mut out);
+        let in_database = opencode_db_updated_times(&root);
+        discover_opencode_tree(&root, workspace, &in_database, &mut seen_sessions, &mut out);
         discover_opencode_db(&root, workspace, &mut seen_sessions, &mut out);
     }
     out
+}
+
+/// `time_updated` of every session row, hidden (archived / subagent) rows
+/// included. Empty when the database is missing, unreadable or predates the
+/// column: its sessions are not discovered either, so the tree stays in use.
+pub(super) fn opencode_db_updated_times(root: &Path) -> std::collections::HashMap<String, i64> {
+    let db = root.join("opencode.db");
+    if !db.is_file() {
+        return Default::default();
+    }
+    let Ok(conn) = rusqlite::Connection::open_with_flags(
+        &db,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    ) else {
+        return Default::default();
+    };
+    let Ok(mut stmt) = conn.prepare("SELECT id, time_updated FROM session") else {
+        return Default::default();
+    };
+    let Ok(rows) = stmt.query_map([], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, Option<i64>>(1)?.unwrap_or(0)))
+    }) else {
+        return Default::default();
+    };
+    // All or nothing: a partial set would flip a session between its copies
+    // from one scan to the next.
+    rows.collect::<Result<_, _>>().unwrap_or_default()
+}
+
+/// OpenCode 1.2+ copies the JSON tree into `opencode.db` once, never reads the
+/// tree again and leaves it on disk. The database copy wins unless the tree
+/// was updated later (a 1.1 binary still writing it after trying 1.2).
+fn opencode_tree_superseded(
+    in_database: &std::collections::HashMap<String, i64>,
+    session_id: &str,
+    meta: &serde_json::Value,
+) -> bool {
+    let tree_updated = meta
+        .get("time")
+        .and_then(|time| time.get("updated"))
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(0);
+    in_database
+        .get(session_id)
+        .is_some_and(|db_updated| *db_updated >= tree_updated)
+}
+
+/// `<root>` of a tree session file `<root>/storage/session/<project>/<id>.json`.
+pub(super) fn opencode_tree_root(file: &Path) -> Option<&Path> {
+    let session_dir = file.parent()?.parent()?;
+    let storage = session_dir.parent()?;
+    (session_dir.file_name()? == "session" && storage.file_name()? == "storage")
+        .then(|| storage.parent())
+        .flatten()
+}
+
+/// Whether an indexed tree session file is superseded by its root's database
+/// (see [`opencode_tree_superseded`]); unreadable metadata never is.
+pub(super) fn opencode_tree_file_superseded(
+    in_database: &std::collections::HashMap<String, i64>,
+    session_id: &str,
+    file: &Path,
+) -> bool {
+    read_small_json(file, MAX_OPENCODE_META_BYTES)
+        .is_some_and(|meta| opencode_tree_superseded(in_database, session_id, &meta))
 }
 
 /// Legacy JSON storage tree: `storage/session/<projectId>/<sessionId>.json`
@@ -736,6 +978,7 @@ pub(super) fn discover_opencode(workspace: &Path) -> Vec<SessionFile> {
 fn discover_opencode_tree(
     root: &Path,
     workspace: &Path,
+    in_database: &std::collections::HashMap<String, i64>,
     seen_sessions: &mut std::collections::HashSet<String>,
     out: &mut Vec<SessionFile>,
 ) {
@@ -775,7 +1018,10 @@ fn discover_opencode_tree(
                 .map(str::to_string)
                 .or_else(|| path.file_stem().and_then(|s| s.to_str()).map(str::to_string))
                 .unwrap_or_default();
-            if session_id.is_empty() || !seen_sessions.insert(session_id.clone()) {
+            if session_id.is_empty()
+                || opencode_tree_superseded(in_database, &session_id, &meta)
+                || !seen_sessions.insert(session_id.clone())
+            {
                 continue;
             }
             out.push(SessionFile {
@@ -1759,14 +2005,7 @@ mod tests {
         );
 
         let _guard = HomeGuard::set(&home);
-        // A stray KIMI_HOME on the host would redirect the legacy home.
-        let prev_kimi_home = std::env::var_os("KIMI_HOME");
-        std::env::remove_var("KIMI_HOME");
         let found = discover_kimi(&workspace);
-        match &prev_kimi_home {
-            Some(value) => std::env::set_var("KIMI_HOME", value),
-            None => std::env::remove_var("KIMI_HOME"),
-        }
         let mut ids: Vec<&str> = found.iter().map(|f| f.session_id.as_str()).collect();
         ids.sort();
         assert_eq!(ids, ["managed", "old-cli"]);
@@ -1827,7 +2066,8 @@ mod tests {
         let slug = qoder_encode_project_slug(&workspace.to_string_lossy());
         let dir = home.join(".qoder").join("projects").join(&slug);
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("sess-1.jsonl"), "{}\n").unwrap();
+        let line = serde_json::json!({"cwd": workspace.to_string_lossy()});
+        std::fs::write(dir.join("sess-1.jsonl"), format!("{line}\n")).unwrap();
         std::fs::write(dir.join("notes.txt"), "x").unwrap();
 
         let _guard = HomeGuard::set(&home);
@@ -1848,7 +2088,8 @@ mod tests {
         let slug = qoder_encode_project_slug(&workspace.to_string_lossy());
         let dir = home.join(".qoder-cn").join("projects").join(&slug);
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("sess-cn.jsonl"), "{}\n").unwrap();
+        let line = serde_json::json!({"cwd": workspace.to_string_lossy()});
+        std::fs::write(dir.join("sess-cn.jsonl"), format!("{line}\n")).unwrap();
 
         let _guard = HomeGuard::set(&home);
         let found = discover_qoder(&workspace, crate::engine::qoder::QoderDistribution::Cn);
@@ -1861,6 +2102,66 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn qoder_project_dirs_include_reported_chinese_windows_slug() {
+        let base = Path::new("projects");
+        let dirs = qoder_project_dirs(
+            base,
+            Path::new(r"E:\公司\深圳睿服科技\04Project\RFKJ\261015RuiFuOperationsBusiPlat"),
+        );
+        assert!(dirs.iter().any(|dir| dir.path == base.join(
+            "E------------04Project-RFKJ-261015RuiFuOperationsBusiPlat"
+        )));
+    }
+
+    #[test]
+    fn discover_qoder_accepts_sanitized_and_legacy_dirs_without_duplicates() {
+        let home = scratch_dir("qoder-unicode");
+        let workspace = home.join("中文 工作区");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let spelling = workspace.to_string_lossy();
+        let sanitized = super::super::claude_encode_project_path(&spelling);
+        let legacy = qoder_encode_project_slug(&spelling);
+        assert_ne!(sanitized, legacy);
+        let _guard = HomeGuard::set(&home);
+        for (distribution, config) in [
+            (crate::engine::qoder::QoderDistribution::Global, ".qoder"),
+            (crate::engine::qoder::QoderDistribution::Cn, ".qoder-cn"),
+        ] {
+            let base = home.join(config).join("projects");
+            for (slug, id) in [
+                (&sanitized, "shared"),
+                (&legacy, "shared"),
+                (&legacy, "legacy-only"),
+            ] {
+                let dir = base.join(slug);
+                std::fs::create_dir_all(&dir).unwrap();
+                let content = if slug == &sanitized {
+                    serde_json::json!({"cwd": workspace.to_string_lossy()}).to_string()
+                } else {
+                    "{}".to_string()
+                };
+                std::fs::write(dir.join(format!("{id}.jsonl")), format!("{content}\n")).unwrap();
+            }
+            let found = discover_qoder(&workspace, distribution);
+            let mut ids: Vec<_> = found.iter().map(|file| file.session_id.as_str()).collect();
+            ids.sort();
+            assert_eq!(ids, ["legacy-only", "shared"]);
+            assert!(found
+                .iter()
+                .all(|file| file.engine == distribution.engine_id()));
+            assert_eq!(
+                found
+                    .iter()
+                    .find(|file| file.session_id == "shared")
+                    .unwrap()
+                    .file_path,
+                base.join(&sanitized).join("shared.jsonl")
+            );
+        }
+        std::fs::remove_dir_all(&home).unwrap();
     }
 
     /// OpenCode session metadata jsons are matched to the workspace by their
@@ -1993,6 +2294,59 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
+    /// OpenCode 1.2+ migrates the JSON tree into opencode.db and leaves the
+    /// tree behind, frozen. A migrated session must resolve to its database
+    /// row (history and editing), and a row the database hides (archived) must
+    /// not resurface from the stale tree. Tree-only sessions stay visible, and
+    /// a tree a 1.1 binary kept updating after a 1.2 trial stays authoritative.
+    #[test]
+    fn discover_opencode_prefers_database_rows_over_frozen_tree_copies() {
+        let home = scratch_dir("discover-opencode-migrated");
+        let workspace = home.join("ws");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let ws = workspace.to_string_lossy().to_string();
+        let data_root = home.join(".local/share/opencode");
+        let project = data_root.join("storage/session/b8119e41");
+        std::fs::create_dir_all(&project).unwrap();
+        for (id, updated) in [("ses_migrated", 2), ("ses_archived", 1), ("ses_tree_only", 1), ("ses_downgraded", 50)] {
+            std::fs::write(
+                project.join(format!("{id}.json")),
+                serde_json::json!({"id": id, "projectID": "b8119e41", "directory": ws, "time": {"updated": updated}}).to_string(),
+            )
+            .unwrap();
+        }
+        let db = data_root.join("opencode.db");
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE session(id TEXT PRIMARY KEY, directory TEXT NOT NULL,
+                time_archived INTEGER, time_updated INTEGER NOT NULL);",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session VALUES('ses_migrated',?1,NULL,2),('ses_archived',?1,9,1),('ses_downgraded',?1,NULL,10)",
+            [&ws],
+        )
+        .unwrap();
+        drop(conn);
+
+        let _guard = HomeGuard::set(&home);
+        let found = discover_opencode(&workspace);
+        let mut ids: Vec<&str> = found.iter().map(|f| f.session_id.as_str()).collect();
+        ids.sort();
+        assert_eq!(ids, ["ses_downgraded", "ses_migrated", "ses_tree_only"]);
+        let migrated = found.iter().find(|f| f.session_id == "ses_migrated").unwrap();
+        assert_eq!(
+            super::super::split_opencode_db_path(&migrated.file_path),
+            Some((db.clone(), "ses_migrated".to_string()))
+        );
+        for id in ["ses_tree_only", "ses_downgraded"] {
+            let tree = found.iter().find(|f| f.session_id == id).unwrap();
+            assert_eq!(tree.file_path, project.join(format!("{id}.json")));
+        }
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
     /// v0.9 upgrade path: codex rollouts under managed provider homes are
     /// enumerated alongside the active home's sessions.
     #[test]
@@ -2018,13 +2372,7 @@ mod tests {
         std::fs::write(managed.join("rollout-2026-08-19T00-00-00-old.jsonl"), "").unwrap();
 
         let _guard = HomeGuard::set(&home);
-        let prev_codex_home = std::env::var_os("CODEX_HOME");
-        std::env::remove_var("CODEX_HOME");
         let found = codex_candidates();
-        match &prev_codex_home {
-            Some(value) => std::env::set_var("CODEX_HOME", value),
-            None => std::env::remove_var("CODEX_HOME"),
-        }
         let names: Vec<String> = found
             .iter()
             .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
@@ -2096,5 +2444,65 @@ mod tests {
         assert_eq!(found[0].session_id, "mvs_hit");
         assert!(found[0].file_path.ends_with("messages.jsonl"));
         std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn qoder_cwd_cache_rechecks_changed_files_and_skips_unrelated_cwd() {
+        let home = scratch_dir("qoder-cwd-cache");
+        let frontend = home.join("前端");
+        let backend = home.join("后端");
+        let bucket = qoder_cli_project_slug(&frontend.to_string_lossy());
+        let transcript = home.join("session.jsonl");
+        let read = || {
+            qoder_transcript_cwd(&transcript, &bucket, &std::fs::metadata(&transcript).unwrap())
+        };
+        std::fs::write(&transcript, "{}\n").unwrap();
+        assert_eq!(read(), None);
+        let text = [
+            serde_json::json!({"cwd": "/unrelated"}),
+            serde_json::json!({"cwd": backend}),
+            serde_json::json!({"cwd": frontend}),
+        ]
+        .map(|line| line.to_string())
+        .join("\n");
+        std::fs::write(&transcript, text).unwrap();
+        assert_eq!(read().as_deref(), backend.to_str());
+        assert_eq!(read().as_deref(), backend.to_str());
+        std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    /// 期望值来自 qodercli 1.1.83 的编码函数：按 UTF-16 码元替换非字母数字，
+    /// 超过 200 个字符时截断并追加对原路径计算的哈希。
+    #[test]
+    fn qoder_project_dirs_match_cli_for_astral_and_long_paths() {
+        let base = Path::new("projects");
+        let cases = [
+            (r"C:\".to_string(), "C--".to_string()),
+            ("/Users/a/🎉项目".to_string(), "-Users-a-----".to_string()),
+            ("/Users/a/𠮷野家".to_string(), "-Users-a-----".to_string()),
+            (
+                format!("/{}", "a".repeat(199)),
+                format!("-{}", "a".repeat(199)),
+            ),
+            (
+                format!("/{}", "a".repeat(200)),
+                format!("-{}-84q8za", "a".repeat(199)),
+            ),
+            (
+                format!("/Users/foo/{}proj", "很长的目录名/".repeat(40)),
+                format!("-Users-foo-{}-cxtcfr", "-".repeat(189)),
+            ),
+            (
+                format!(r"D:\工作\{}proj", r"很长的目录名\".repeat(40)),
+                format!("D{}-41qg6d", "-".repeat(199)),
+            ),
+        ];
+        for (workspace, slug) in cases {
+            let dirs = qoder_project_dirs(base, Path::new(&workspace));
+            assert!(
+                dirs.iter().any(|dir| dir.path == base.join(&slug)),
+                "{workspace} should map to {slug}, got {dirs:?}"
+            );
+        }
     }
 }

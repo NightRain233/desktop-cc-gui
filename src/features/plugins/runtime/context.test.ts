@@ -15,6 +15,7 @@ import {
   pageRegistry,
   panelTabRegistry,
   sessionMenuRegistry,
+  fileLinkMenuRegistry,
   settingsRegistry,
   statusBarRegistry,
   composerStatusRegistry,
@@ -44,7 +45,6 @@ vi.mock("./worktree-bridge", () => ({ createPluginWorktree: vi.fn(async () => ({
 vi.mock("./session-run-bridge", () => ({
   startPluginChatRun: vi.fn(async () => ({ runId: "run-1", sessionId: "sess-1" })),
   interruptPluginChatRun: vi.fn(async () => undefined),
-  sendPluginSessionMessage: vi.fn(async () => ({ runId: "run-send-1", sessionId: "sess-1" })),
 }));
 
 function fakeStorage(): PluginContextBackend & {
@@ -525,7 +525,8 @@ describe("createPluginContext", () => {
     const bridge = await import("./session-run-bridge");
     const backend = fakeStorage();
     const { ctx } = createPluginContext(manifest(["host:session"]), backend, { appVersion: "1" });
-    const def = { engine: "pi", prompt: "review", workspacePath: "/w" };
+    expect(ctx.sessions.supportsResume).toBe(true);
+    const def = { engine: "pi", prompt: "review", workspacePath: "/w", sessionId: "existing" };
     await expect(ctx.sessions.startRun(def)).resolves.toEqual({ runId: "run-1", sessionId: "sess-1" });
     expect(bridge.startPluginChatRun).toHaveBeenCalledWith("test-plugin", def);
     await expect(
@@ -541,30 +542,12 @@ describe("createPluginContext", () => {
   it("sessions.startRun throws without host:session", () => {
     const backend = fakeStorage();
     const { ctx } = createPluginContext(manifest(["agent"]), backend, { appVersion: "1" });
-    expect(() => ctx.sessions.startRun({ engine: "pi", prompt: "p", workspacePath: "/w" })).toThrow(
+    expect(() => ctx.sessions.startRun({ engine: "pi", prompt: "p", workspacePath: "/w", sessionId: "existing" })).toThrow(
       /host:session/,
     );
     expect(() => ctx.sessions.interruptRun({ engine: "pi", workspacePath: "/w" })).toThrow(
       /host:session/,
     );
-  });
-
-  it("sessions.sendMessage requires its dedicated permission and delegates the explicit target", async () => {
-    const bridge = await import("./session-run-bridge");
-    const backend = fakeStorage();
-    const { ctx } = createPluginContext(manifest(["host:session:send"]), backend, { appVersion: "1" });
-    const def = {
-      engine: "pi",
-      sessionId: "sess-1",
-      workspacePath: "/w",
-      prompt: "run the report",
-      ifBusy: "queue" as const,
-    };
-    await expect(ctx.sessions.sendMessage(def)).resolves.toEqual({ runId: "run-send-1", sessionId: "sess-1" });
-    expect(bridge.sendPluginSessionMessage).toHaveBeenCalledWith("test-plugin", def);
-
-    const denied = createPluginContext(manifest(["host:session"]), backend, { appVersion: "1" });
-    expect(() => denied.ctx.sessions.sendMessage(def)).toThrow(/host:session:send/);
   });
 
   it("storage round-trips through the backend in the plugin's namespace", async () => {
@@ -903,6 +886,12 @@ describe("createPluginContext", () => {
       (ctx: PluginContext) =>
         ctx.ui.registerSessionMenuItem({ label: () => "S", run: () => {} }),
       sessionMenuRegistry,
+    ],
+    [
+      "ui:file-link-menu",
+      (ctx: PluginContext) =>
+        ctx.ui.registerFileLinkMenuItem({ label: () => "Open in Obsidian", run: () => {} }),
+      fileLinkMenuRegistry,
     ],
   ])(
     "%s gates and registers under plugin:<id>, disposer removes (phase-2 ui points)",
@@ -1244,6 +1233,28 @@ describe("permissioned SDK calls from guarded plugin callbacks", () => {
       bridgeInvoke: (command, args) => tauriInvoke(command, args),
     };
   }
+
+  it("lets usage and limits calls through from guarded callbacks while direct IPC stays blocked", async () => {
+    nativeInvoke.mockImplementation(async (cmd) =>
+      cmd === "plugin_usage_query"
+        ? { rows: [], firstDay: null, scannedAt: 1, scanning: false, unknownModels: [] }
+        : { providers: [] },
+    );
+    const backend: PluginContextBackend = {
+      ...ipcStorage(),
+      usageQuery: (pluginId, query) => tauriInvoke("plugin_usage_query", { pluginId, query }),
+      limitsGet: (pluginId, options) => tauriInvoke("plugin_limits_get", { pluginId, ...options }),
+    };
+    const { ctx } = createPluginContext(manifest(["usage.read", "limits.read"]), backend, {
+      appVersion: "1",
+    });
+    // The shape a plugin writes in onChange: query from inside plugin code.
+    const result = await runAsPlugin(() => ctx.usage.query({ from: "2026-10-01", to: "2026-10-27" }));
+    expect(result.scannedAt).toBe(1);
+    await expect(runAsPlugin(() => ctx.limits.get({ refresh: true }))).resolves.toEqual({ providers: [] });
+    expect(nativeInvoke).toHaveBeenCalledWith("plugin_usage_query", expect.anything());
+    await expect(runAsPlugin(() => tauriInvoke("plugin_usage_query", {}))).rejects.toThrow(/blocked/);
+  });
 
   it("persists workspace menu changes while rejecting direct IPC in that callback", async () => {
     const data = new Map<string, unknown>();

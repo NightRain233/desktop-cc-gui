@@ -1,5 +1,20 @@
 # Chat streaming regression
 
+Open `/tests/browser/file-tree-features.html?reset=1` for the real file tree
+against a synthetic directory listing. Expand `a` once to reach
+`a/b/c` and show its file. The readout shows every
+`listDir` call: Expand Loaded must not add calls, Collapse All leaves the
+workspace root open. The Git ignore toggle hides only entries marked ignored;
+dotfiles and tracked `build` remain visible. Switch between workspaces A and B, then reload
+without `?reset=1` to verify independent expanded paths. The
+fixture does not read the real disk or test native directory permissions.
+
+Open `/tests/browser/workspace-pin.html` to try the real workspace sidebar with
+synthetic projects. Right-click a project to pin or unpin it; pinned projects
+stay in their own group and show a small pin icon. Drag the folder handle to
+reorder within pinned or regular projects. The fixture uses in-memory IPC and
+does not change registered workspaces; refresh restores its initial state.
+
 Open `/tests/browser/interface-typography.html` for the real General settings
 controls with in-memory persistence. Expand Advanced and change the UI,
 content and code sizes independently using px inputs (blur or Enter to save).
@@ -12,10 +27,12 @@ four typography fields, not fonts. Persistence is fixture-only, not the running 
 
 Open `/tests/browser/concurrent-status.html` for concurrent session indicators:
 the real `AiChatSidebar` and `SessionTab` each render 1, 6 (default), or 12
-synthetic sessions. Switch Processing / Retry / Complete, light / dark, and
-Normal / Reduced motion. The fixture selects the shipped reduced-motion CSS
-declaration by changing its media condition, without overriding its animation
-styles. Processing must retain a changing `transform` on all status dots, while
+synthetic sessions, plus the workspace header's aggregate run dot (one per
+workspace, present only while something streams). Switch Processing / Retry /
+Complete, light / dark, and Normal / Reduced motion. The fixture selects the
+shipped reduced-motion CSS declaration by changing its media condition, without
+overriding its animation styles. Processing must retain a changing `transform`
+on all status dots, while
 Retry, Complete and Reduced motion must have no running status animation.
 The JSON readout reports FAIL if an active keyframe includes any property other
 than `transform` or `opacity` (including `boxShadow`, `filter` or
@@ -72,6 +89,14 @@ completion, replacement, truncation, pending-timer cleanup, continuous Unicode
 appends, coalescing and unmount. It needs no model, account or saved conversation.
 The visible update count depends on browser scheduling; it is not a model-speed
 or frame-rate benchmark.
+
+Open `/tests/browser/run-status-strip.html` with the Vite dev server running to
+check the actual chat status strip against seeded chat/git stores. The fixture
+shows one settled and one active delegated task; `后台任务完成` appends a hidden
+transcript status row, so the pill must move from 1/2 to 2/2 and the detail row
+must read 已完成 while streaming remains active. The page asserts that sequence
+itself and reports `PASS` or `FAIL` with the failed check; the buttons stay for
+manual replay. No model, IPC or saved conversation.
 
 Run the deterministic timing, grapheme, Markdown and store regressions with:
 
@@ -349,3 +374,19 @@ an empty URL is refused, and that Escape cancels. Also measures the two pencils:
 both glyph and padding are in `em`, so the name pencil must track the 14px name
 line and the URL pencil the 11px code line (and the interface font / zoom with
 them), not a fixed pixel box. No app, no backend, no real config file.
+
+## CLI 模型长名称
+
+打开 `/tests/browser/cli-model-names.html`，使用真实 `CliMenu` 与合成模型目录验证 #1477。
+页面加载后自动打开菜单自检，并在 `#result` 输出 PASS/FAIL 与实测数值：模型行和展开的渠道行没有被裁切、
+浮层距窗口左右边缘不少于 16px、搜索筛掉最长名称后浮层宽度和输入框横向位置不变
+（浮层底部对齐，结果变少时输入框会下移，这是预期行为）、展开渠道列表或选中超长渠道不改变浮层宽度，
+选中后折叠行用 `title` 提供全名。边距要在右侧空间不足时才有检验力：
+用约 800px 宽的窗口打开 `?side=left`，否则浮层离窗口边缘很远，这一项必然通过。
+窄于 768px 时没有浮层，自检输出 SKIP。自检结束后菜单收起，下面几项手动检查：
+默认选择超长中文、emoji 和连续英文名称，名称和说明应换行，模型列表可滚动；
+选择 `deepseek-v4-pro` / `deepseek-v4.1-flash` 后，页面输出应为对应的完整 ID。
+切换入口位置检查浮层向左右展开，桌面宽度上限 480px，窗口缩放后不越界。
+底部入口悬停或键盘聚焦应显示完整名称与 ID，打开菜单后提示消失。
+390px 窄屏点击引擎行进入模型对话框，长名称不得横向溢出，发送按钮仍可见。
+此页面不读取真实配置，不调用 CLI，不代表原生 WebView 验证。

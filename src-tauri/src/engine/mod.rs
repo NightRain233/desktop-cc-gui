@@ -1,3 +1,4 @@
+mod activity;
 pub mod agy;
 pub mod claude;
 mod claude_channel;
@@ -22,6 +23,8 @@ pub mod dsh;
 mod dsh_images;
 mod dsh_session;
 mod events;
+pub mod fork;
+mod fork_dsh;
 pub mod grok;
 mod grok_acp;
 pub mod images;
@@ -37,12 +40,14 @@ pub mod opencode_server;
 mod opencode_session;
 pub mod pi_family;
 pub mod pi_family_auth;
+mod pi_family_env;
 pub mod plan_review;
 pub mod qoder;
 mod qoder_session;
 mod reader;
 mod registry;
 pub mod resolve;
+mod shell_env;
 pub mod wsl_transport;
 
 pub(crate) use resolve::command_for_binary;
@@ -51,7 +56,7 @@ pub(crate) use resolve::command_for_binary;
 pub(crate) use events::{
     assistant_message, parse_todo_args, parse_todo_result, parse_tool_args_value, push_session_id, safe_prompt_arg,
     tool_call_message, tool_call_message_with_id, tool_call_patch_with_id,
-    tool_path_arg, tool_result_patch, tool_result_patch_with_id,
+    tool_path_arg, tool_result_patch, tool_result_patch_with_id, tool_settled,
 };
 pub use events::{EngineEvent, TodoItem, TodosPayload};
 pub use plan_review::{PlanApproval, PlanReview, PlanReviewKind};
@@ -61,7 +66,8 @@ pub use registry::{ChildEntry, ProcessRegistry};
 // Stdout reader / per-turn streaming plumbing (reader.rs).
 pub use reader::sweep_staging_dirs;
 pub(crate) use reader::{
-    cleanup_staged_files, read_line_capped, run_reader, spawn_stderr_capture, spawn_stdin_writer,
+    cleanup_staged_files, read_line_capped, run_process_reader,
+    spawn_stderr_capture, spawn_stdin_writer,
     LineRead, RunContext, TurnCore, TurnState, VirtualRunGuard, MAX_LINE_BYTES,
 };
 
@@ -167,6 +173,10 @@ pub struct SendRequest {
     /// 逐次调用的工具白名单（任务工作台只读节点）：引擎必须真正把它兑现
     /// 为运行时约束，否则 prepare_launch 直接拒绝——不允许用节点名假装。
     pub allowed_tools: Option<Vec<String>>,
+    /// 纯文本轮次（插件介绍翻译，translate.rs）：不给模型任何工具、不挂
+    /// MCP、不加载扩展。输入是不可信的第三方文本，必须真正零工具；引擎
+    /// 不能兑现（`Engine::supports_no_tools`）时 prepare_launch 直接拒绝。
+    pub no_tools: bool,
 }
 pub struct BuiltCommand {
     pub command: Command,
@@ -217,6 +227,17 @@ pub trait Engine: Send + Sync {
     }
     /// Parse one NDJSON stdout line into zero or more events.
     fn parse_line(&self, line: &str, out: &mut Vec<EngineEvent>);
+    /// Attach this run's served-model sidecar before the reader starts.
+    /// Engines whose injected extension records the provider's own `model`
+    /// read it back; the default is a no-op.
+    fn set_served_models_file(&self, _path: &std::path::Path) {}
+    /// True when this run's stream can report what served it (`Served`).
+    /// The response check keeps its badge while that report is pending;
+    /// a run that can never report shows nothing until evidence arrives,
+    /// instead of an "unreported" badge on every turn.
+    fn reports_served(&self) -> bool {
+        false
+    }
     /// True when the engine drives its own transport (e.g. a host WS session)
     /// instead of spawning a child process. send_message routes these to a
     /// virtual run: no spawn, no pid — the registry entry carries only the
@@ -250,6 +271,17 @@ pub trait Engine: Send + Sync {
     fn supports_memory(&self) -> bool {
         false
     }
+    /// Mount the user's「按需启动」MCP entries for this launch: re-point each
+    /// winning definition at `--mcp-lazy` through the engine's own per-launch
+    /// channel (see mcp/launch.rs). Default: no channel, nothing to do.
+    fn mount_on_demand(
+        &self,
+        _built: &mut BuiltCommand,
+        _servers: &[crate::mcp::launch::OnDemandServer],
+        _workspace: &std::path::Path,
+    ) -> Result<(), String> {
+        Ok(())
+    }
     /// Whether this engine supports reasoning effort configuration.
     fn supports_effort(&self) -> bool {
         false
@@ -258,6 +290,13 @@ pub trait Engine: Send + Sync {
     /// read-only nodes). Engines that return false are rejected before
     /// spawn rather than silently running without the constraint.
     fn supports_tool_constraints(&self) -> bool {
+        false
+    }
+    /// Whether this engine can run a turn with zero tools and zero MCP
+    /// servers (`SendRequest::no_tools`). Engines that return false are
+    /// rejected before spawn: a text-only turn fed untrusted input must not
+    /// silently fall back to the default tool set.
+    fn supports_no_tools(&self) -> bool {
         false
     }
     /// Permission modes this engine can honor at spawn ("auto" | "manual" |
@@ -582,6 +621,7 @@ fn prepare_launch(
     computer_use: Option<bool>,
     memory_bot: Option<String>,
     allowed_tools: Option<Vec<String>>,
+    no_tools: bool,
     wsl: bool,
 ) -> Result<Launch, String> {
     let engine_impl = engine_by_id(engine).ok_or_else(|| format!("unknown engine: {engine}"))?;
@@ -615,6 +655,18 @@ fn prepare_launch(
         Some(_) => return Err("tool constraints must not be empty".into()),
         None => None,
     };
+    // 零工具轮次与白名单/电脑操控/记忆互斥：它们都会往进程里挂工具。
+    if no_tools {
+        if !engine_impl.supports_no_tools() {
+            return Err(format!("engine {engine} does not support tool-less runs"));
+        }
+        if allowed_tools.is_some()
+            || computer_use == Some(true)
+            || memory_bot.as_deref().is_some_and(|id| !id.trim().is_empty())
+        {
+            return Err("tool-less runs cannot carry tools, computer use or memory".into());
+        }
+    }
     let provider_id = provider_id.filter(|s| !s.trim().is_empty());
     let provider = crate::config::resolve_provider(engine, provider_id.as_deref())?;
     let channel_env = provider
@@ -677,6 +729,7 @@ fn prepare_launch(
             })
             .filter(|_| engine_impl.supports_memory()),
         allowed_tools,
+        no_tools,
     };
     let bin = engine_bin(&settings, engine);
     // Host-transport engines spawn through their driver instead: codex/grok
@@ -693,6 +746,17 @@ fn prepare_launch(
     } else {
         engine_impl.build_command(&req, &bin)?
     };
+    // 按需启动的 MCP 条目：只对本机工作区、无工具白名单的普通发送生效
+    // （远端 CLI 读不到本机 exe；只读/计划隔离要求零 MCP）。失败就保持
+    // 随会话启动，不拦发送。
+    if !wsl && req.allowed_tools.is_none() && !req.no_tools && !codex_read_only::requested(&req) {
+        let servers = crate::mcp::launch::on_demand_servers(engine, &req.workspace);
+        if !servers.is_empty() {
+            if let Err(error) = engine_impl.mount_on_demand(&mut built, &servers, &req.workspace) {
+                eprintln!("[mcp-lazy] {engine}: on-demand mount skipped: {error}");
+            }
+        }
+    }
     for (key, value) in &channel_env {
         built.command.env(key, value);
     }
@@ -826,6 +890,7 @@ pub(crate) async fn plugin_agent_send(
         None,
         None,
         allowed_tools,
+        false,
     )
     .await
 }
@@ -888,6 +953,45 @@ pub(crate) async fn mission_agent_send(
         None,
         None,
         allowed_tools,
+        false,
+    )
+    .await
+}
+
+/// 纯文本翻译轮次入口（translate::translate_text_start 调用）：同一条
+/// spawn/reader/registry 管线，事件借用任务工作台的 `mission-agent://event`
+/// 流（前端按 run id 路由，未登记的 run 被忽略）。`no_tools` 恒为真：
+/// 输入是不可信的第三方文本，引擎不能兑现零工具时 prepare_launch 拒绝。
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn translate_text_send(
+    state: &crate::AppState,
+    engine: String,
+    workspace_path: String,
+    prompt: String,
+    model: Option<String>,
+    effort: Option<String>,
+    provider_id: Option<String>,
+    run_id: String,
+) -> Result<SendResult, String> {
+    send_message_inner_with_sink(
+        state,
+        Arc::clone(&state.mission_sink),
+        engine,
+        workspace_path,
+        None,
+        prompt,
+        Vec::new(),
+        None,
+        None,
+        model,
+        effort,
+        None,
+        provider_id,
+        Some(run_id),
+        None,
+        None,
+        None,
+        true,
     )
     .await
 }
@@ -928,6 +1032,7 @@ pub async fn send_message_inner(
         computer_use,
         memory_bot,
         None,
+        false,
     )
     .await
 }
@@ -951,6 +1056,7 @@ async fn send_message_inner_with_sink(
     computer_use: Option<bool>,
     memory_bot: Option<String>,
     allowed_tools: Option<Vec<String>>,
+    no_tools: bool,
 ) -> Result<SendResult, String> {
     // A claude process may still be alive for a background task's follow-up
     // turn on this very session. A new process would stop that task, so the
@@ -1020,6 +1126,7 @@ async fn send_message_inner_with_sink(
     let reader_abort = Arc::new(std::sync::OnceLock::new());
     {
         let mut map = state.processes.0.lock().map_err(|e| e.to_string())?;
+        state.processes.ensure_session_not_editing(session_id.as_deref())?;
         if map.contains_key(&run_id) {
             return Err("run id already active".into());
         }
@@ -1028,19 +1135,20 @@ async fn send_message_inner_with_sink(
                 "too many concurrent runs ({MAX_CONCURRENT_RUNS}); wait for one to finish"
             ));
         }
-        map.insert(
-            run_id.clone(),
-            ChildEntry {
-                child: None,
-                pid: 0,
-                run_id: run_id.clone(),
-                killed: Arc::clone(&killed),
-                reader_abort: Arc::clone(&reader_abort),
-                stdin: None,
-                questions: Arc::new(Mutex::new(HashMap::new())),
-                plans: Arc::new(Mutex::new(HashMap::new())),
-            },
-        );
+        let entry = ChildEntry {
+            child: None,
+            pid: 0,
+            run_id: run_id.clone(),
+            killed: Arc::clone(&killed),
+            reader_abort: Arc::clone(&reader_abort),
+            stdin: None,
+            questions: Arc::new(Mutex::new(HashMap::new())),
+            plans: Arc::new(Mutex::new(HashMap::new())),
+        };
+        if let Some(session_id) = session_id.as_ref() {
+            map.entry(session_id.clone()).or_insert_with(|| entry.clone());
+        }
+        map.insert(run_id.clone(), entry);
     }
     let reserved = run_id.clone();
     let result = send_reserved(
@@ -1063,6 +1171,7 @@ async fn send_message_inner_with_sink(
         computer_use,
         memory_bot,
         allowed_tools,
+        no_tools,
     )
     .await;
     if result.is_err() {
@@ -1139,6 +1248,7 @@ async fn send_reserved(
     computer_use: Option<bool>,
     memory_bot: Option<String>,
     allowed_tools: Option<Vec<String>>,
+    no_tools: bool,
 ) -> Result<SendResult, String> {
     // WSL 远程工作区:引擎进程经 ssh 在发行版内执行(见 wsl_transport)。
     let wsl_tp = wsl_transport::transport_for_workspace(&state.db, &workspace_path);
@@ -1169,14 +1279,39 @@ async fn send_reserved(
         permission,
         // Every user-granted directory rides along as a launch argument, so
         // a grant approved mid-conversation takes effect on the next send
-        // (each send is a fresh process).
-        state.db.granted_roots().unwrap_or_default(),
+        // (each send is a fresh process). Tool-less runs have no file tool
+        // to hand them to.
+        if no_tools {
+            Vec::new()
+        } else {
+            state.db.granted_roots().unwrap_or_default()
+        },
         provider_id,
         computer_use,
         memory_bot,
         allowed_tools,
+        no_tools,
         wsl_tp.is_some(),
     )?;
+    if wsl_tp.is_none() && matches!(engine.as_str(), "pi" | "omp") {
+        // 只向登录 shell 查询当前引擎配置中的变量：PI 用 $VAR，OMP 用裸名字。
+        // 只注入这次子进程；WSL 不带本机 env，跳过。
+        pi_family_env::apply(&mut launch.built.command, &engine).await;
+    }
+    // pi/omp: the injected extension observes the provider response's own
+    // `model` field and appends it to a per-run sidecar. The reader consults
+    // that file when `message_end` has no `upstreamModel`. Remote workspaces
+    // run the CLI inside WSL, which cannot write this host-side path; runs
+    // without the extension have nothing to write it.
+    if wsl_tp.is_none() && pi_family::loads_served_model_bridge(&engine, &launch.req) {
+        if let Some(path) = pi_family::prepare_served_models_file(&run_id) {
+            launch.engine_impl.set_served_models_file(&path);
+            launch
+                .built
+                .command
+                .env("CCGUI_SERVED_MODEL_FILE", path.as_os_str());
+        }
+    }
     // Host-stream engines drive their own transport: no child process — the
     // registry entry only routes interrupts to the transport task. Their
     // drivers spawn locally, so a remote workspace either keeps the CLI
@@ -1275,6 +1410,50 @@ async fn send_reserved(
     // Harmless for the WSL/ssh-wrapped command (local env doesn't cross).
     command.env("PATH", resolve::cli_search_path());
 
+    let signature = (engine == "codebuddy"
+        && wsl_tp.is_none()
+        && Arc::ptr_eq(&sink, &state.sink)
+        && computer_use != Some(true)
+        && launch.req.memory_bot.is_none())
+        .then(|| codebuddy::launch_signature(&command, &cleanup_files))
+        .flatten();
+    if engine == "codebuddy" {
+        if let Some(session_id) = launch.req.session_id.as_deref() {
+            let idle = state.processes.4.lock().ok().and_then(|mut pool| {
+                let idle = pool.get_mut(session_id)?;
+                let resume = idle.resume.take().filter(|_| signature == Some(idle.signature));
+                Some((resume, idle.exited.clone()))
+            });
+            if let Some((resume, mut exited)) = idle {
+                if let (Some(resume), Some(payload)) = (resume, launch.built.stdin_payload.as_ref()) {
+                    let (accept, accepted) = tokio::sync::oneshot::channel();
+                    let turn = codebuddy::ResumeTurn {
+                        run_id: run_id.clone(),
+                        session_id: session_id.to_string(),
+                        // The launch payload starts with the one-time CLI handshake.
+                        payload: payload.rsplit('\n').next().unwrap_or(payload).to_owned(),
+                        killed: Arc::clone(&killed),
+                        reader_abort: Arc::clone(&reader_abort),
+                        comparison_model: launch.comparison_model.clone(),
+                        accept,
+                    };
+                    if resume.send(turn).is_ok() && accepted.await.is_ok() {
+                        cleanup_staged_files(&cleanup_files);
+                        return Ok(SendResult {
+                            run_id,
+                            session_id: Some(session_id.to_string()),
+                        });
+                    }
+                }
+                // Reap a stale process before resuming from disk.
+                if tokio::time::timeout(reader::READER_SETTLE_GRACE, exited.changed()).await.is_err() {
+                    cleanup_staged_files(&cleanup_files);
+                    return Err("Timed out waiting for the previous CodeBuddy process to exit".into());
+                }
+            }
+        }
+    }
+
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
@@ -1351,7 +1530,12 @@ async fn send_reserved(
         );
     }
 
-    let stderr_buf = spawn_stderr_capture(stderr);
+    let (stderr_buf, stderr_reset) = if signature.is_some() {
+        let (buffer, reset) = reader::spawn_reusable_stderr_capture(stderr);
+        (buffer, Some(reset))
+    } else {
+        (spawn_stderr_capture(stderr), None)
+    };
     let initial_model = if engine == "claude" {
         launch
             .req
@@ -1390,7 +1574,12 @@ async fn send_reserved(
         #[cfg(windows)]
         _tree_guard: tree_guard,
     };
-    let reader = tokio::spawn(run_reader(stdout, ctx));
+    let reader = tokio::spawn(run_process_reader(
+        stdout,
+        ctx,
+        signature.map(|signature| (signature, workspace_path)),
+        stderr_reset,
+    ));
     // Registration order is unchanged (entries land before the task can
     // settle); the OnceLock just hands kill()/kill_all() the handle.
     let _ = reader_abort.set(reader.abort_handle());
@@ -1400,6 +1589,7 @@ async fn send_reserved(
         session_id: launch.built.preassigned_session_id,
     })
 }
+
 /// Virtual run path for engines that drive their own transport
 /// ([`Engine::drives_own_transport`]): register a child-less entry whose
 /// `killed` flag and abort handle route interrupts into the transport task,
@@ -1496,6 +1686,15 @@ async fn send_host_stream(
         session_id: resume_session_id,
     })
 }
+#[tauri::command]
+pub async fn close_idle_codebuddy(
+    state: tauri::State<'_, crate::AppState>,
+    session_id: String,
+) -> Result<(), String> {
+    state.processes.close_idle_codebuddy(&session_id);
+    Ok(())
+}
+
 /// Async + spawn_blocking: the kill waits for the Windows tree walk to
 /// finish (see `kill_process_group`), and a synchronous command would hold
 /// that wait on the UI thread — the app would visibly hitch on every Stop.
@@ -1519,8 +1718,16 @@ pub async fn live_runs(
 ) -> Result<Vec<String>, String> {
     Ok(state.processes.live_run_ids(&run_ids))
 }
+/// Live activity facts for the given runs (see `engine/activity.rs`): when
+/// the CLI last wrote output, whether a model response is open, which tools
+/// are running and the retry history. The run-status panel polls this only
+/// while it is open; runs the host no longer tracks are simply absent.
+#[tauri::command]
+pub async fn run_activity(run_ids: Vec<String>) -> Result<Vec<activity::RunActivity>, String> {
+    Ok(activity::snapshot(&run_ids))
+}
 /// Answer a pending question card. Multiple transports share this command:
-/// - claude (control protocol): the answers merge into the parked tool input
+/// - claude / codebuddy (control protocol): the answers merge into the parked tool input
 ///   and ride stdin as a `control_response`.
 /// - omp (rpc-ui): the parked value carries the dialog method; the answer is
 ///   an `extension_ui_response` frame on the CLI's stdin.
@@ -1738,6 +1945,17 @@ pub async fn answer_question(
         )
         .await?;
         // Delivered: drop the parked copy so the turn-end drain skips it.
+        if let Ok(mut questions) = entry.questions.lock() {
+            questions.remove(&request_id);
+        }
+        return Ok(());
+    }
+    if let Some(context) = input.get("codebuddyQuestion") {
+        let frame = codebuddy::question_response(&request_id, context, answers)?;
+        state
+            .processes
+            .write_line(&session_id, frame.to_string())
+            .await?;
         if let Ok(mut questions) = entry.questions.lock() {
             questions.remove(&request_id);
         }
@@ -2104,6 +2322,7 @@ mod codebuddy_launch_tests {
             None,
             None,
             false,
+            false,
         )
         .unwrap();
         assert_eq!(launch.req.model, None);
@@ -2204,6 +2423,7 @@ mod permission_tests {
             computer_use: None,
             memory_bot: None,
             allowed_tools: None,
+            no_tools: false,
         }
     }
 
@@ -2252,6 +2472,55 @@ mod permission_tests {
         assert!(pi_family::omp().build_command(&request, "omp").is_err());
         request.computer_use = Some(true);
         assert!(pi_family::pi().build_command(&request, "pi").is_err());
+    }
+
+    /// 纯文本轮次（插件介绍翻译）：claude 必须卸掉全部内置工具、不连 MCP、
+    /// 不预批任何工具、不落盘会话。
+    #[test]
+    fn claude_no_tools_launch_strips_tools_and_mcp() {
+        let mut request = req(Some("bypass"));
+        request.no_tools = true;
+        let args = argv(&claude::ClaudeEngine::new(), &request);
+        assert!(args.windows(2).any(|w| w == ["--tools", ""]));
+        assert!(args.contains(&"--strict-mcp-config".to_string()));
+        assert!(args.contains(&"--no-session-persistence".to_string()));
+        assert!(args.windows(2).any(|w| w == ["--permission-mode", "default"]));
+        for forbidden in [
+            "--allowedTools",
+            "--mcp-config",
+            "--dangerously-skip-permissions",
+            "--add-dir",
+        ] {
+            assert!(!args.contains(&forbidden.to_string()), "{forbidden} in {args:?}");
+        }
+    }
+
+    #[test]
+    fn pi_no_tools_launch_disables_tools_mcp_and_extensions() {
+        let mut request = req(None);
+        request.no_tools = true;
+        let args = argv(&pi_family::pi(), &request);
+        for flag in ["--no-tools", "--no-mcp", "--no-extensions", "--no-session"] {
+            assert!(args.contains(&flag.to_string()), "{flag} missing from {args:?}");
+        }
+        assert!(!args.contains(&"--extension".to_string()));
+        assert!(!args.contains(&"--tools".to_string()));
+        assert!(!pi_family::loads_served_model_bridge("pi", &request));
+    }
+
+    #[test]
+    fn no_tools_is_refused_where_it_cannot_be_honored() {
+        let mut request = req(None);
+        request.no_tools = true;
+        assert!(pi_family::omp().build_command(&request, "omp").is_err());
+        request.allowed_tools = Some(vec!["read".into()]);
+        assert!(pi_family::pi().build_command(&request, "pi").is_err());
+        for engine in ["codex", "grok", "kimi", "opencode", "codebuddy", "omp", "agy"] {
+            let engine_impl = engine_by_id(engine).unwrap();
+            assert!(!engine_impl.supports_no_tools(), "{engine} claims tool-less support");
+        }
+        assert!(engine_by_id("claude").unwrap().supports_no_tools());
+        assert!(engine_by_id("pi").unwrap().supports_no_tools());
     }
 
     #[test]
@@ -2319,8 +2588,14 @@ mod permission_tests {
         let config: Value =
             serde_json::from_str(&args[at + 1]).expect("mcp config must be inline JSON");
         let server = &config["mcpServers"]["ccgui-computer"];
-        assert_eq!(server["args"], serde_json::json!(["--computer-use-mcp"]));
-        assert!(!server["command"].as_str().unwrap_or_default().is_empty());
+        assert_eq!(server["args"], serde_json::json!([]));
+        // The driver is the separate helper binary, never this executable.
+        assert_eq!(
+            std::path::Path::new(server["command"].as_str().unwrap_or_default())
+                .file_stem()
+                .and_then(|s| s.to_str()),
+            Some(crate::computer_use::HELPER_BIN)
+        );
         // Pre-approved: a click-per-approval loop would be unusable.
         let tools_at = args
             .iter()
@@ -3078,7 +3353,7 @@ mod retry_lifecycle_tests {
             #[cfg(windows)]
             _tree_guard: None,
         };
-        run_reader(stdout, ctx).await;
+        reader::run_reader(stdout, ctx).await;
         let events = std::mem::take(&mut *emitter.0.lock().unwrap());
         events
     }
@@ -3128,7 +3403,7 @@ mod retry_lifecycle_tests {
             #[cfg(windows)]
             _tree_guard: None,
         };
-        run_reader(stdout, ctx).await;
+        reader::run_reader(stdout, ctx).await;
         let events = std::mem::take(&mut *emitter.0.lock().unwrap());
         let last = events.last().unwrap();
         assert_eq!(last["kind"], "error");
@@ -3314,6 +3589,15 @@ mod retry_lifecycle_tests {
         run_id: &str,
         session_id: &str,
     ) -> tokio::process::Child {
+        idle_followup_child_with(registry, run_id, session_id, test_followup_prefs()).await
+    }
+
+    async fn idle_followup_child_with(
+        registry: &Arc<ProcessRegistry>,
+        run_id: &str,
+        session_id: &str,
+        prefs: registry::FollowupPrefs,
+    ) -> tokio::process::Child {
         let mut command = if cfg!(windows) {
             tokio::process::Command::new("sort")
         } else {
@@ -3339,7 +3623,7 @@ mod retry_lifecycle_tests {
                 plans: Arc::new(Mutex::new(HashMap::new())),
             },
         );
-        registry.set_awaiting_followup(session_id, run_id, test_followup_prefs(), true);
+        registry.set_awaiting_followup(session_id, run_id, prefs, true);
         child
     }
 
@@ -3474,6 +3758,39 @@ mod retry_lifecycle_tests {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
         panic!("idle run was not killed after frame construction failed");
+    }
+
+    /// A run launched for computer use has the driver mounted and
+    /// pre-approved. A later ordinary send (desktop or remote) must never be
+    /// written into it: computer use is opted into per send.
+    #[tokio::test]
+    async fn plain_send_never_reuses_a_parked_computer_use_process() {
+        let registry = Arc::new(ProcessRegistry::default());
+        let mut child = idle_followup_child_with(
+            &registry,
+            "cu-run",
+            "s-cu",
+            registry::FollowupPrefs {
+                computer_use: true,
+                ..test_followup_prefs()
+            },
+        )
+        .await;
+        let delivered = deliver_to_idle_followup(&registry, Some("s-cu"), &test_followup_prefs(), || {
+            panic!("the prompt must not reach the computer-use process")
+        })
+        .await
+        .unwrap();
+        assert_eq!(delivered, None);
+        let killed = registry.get("cu-run").unwrap().killed;
+        for _ in 0..100 {
+            if killed.load(std::sync::atomic::Ordering::SeqCst) {
+                let _ = child.kill().await;
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("parked computer-use run was not killed");
     }
 
     /// The first turn settles at its own result even with a task pending, so
@@ -3630,7 +3947,7 @@ mod retry_lifecycle_tests {
         };
         // Unbounded on the old EOF-only reader: the sleep holds the pipe
         // for 600s. POST_EXIT_DRAIN settles this in well under a second.
-        tokio::time::timeout(std::time::Duration::from_secs(5), run_reader(stdout, ctx))
+        tokio::time::timeout(std::time::Duration::from_secs(5), reader::run_reader(stdout, ctx))
             .await
             .expect("reader must settle after child exit, not park on the held pipe");
         let events = std::mem::take(&mut *emitter.0.lock().unwrap());

@@ -6,7 +6,7 @@
  * 插件仓用法（包未发布 npm 前的过渡方案）：复制本文件为插件仓的
  * `src/ccgui-plugin.d.ts`，首行版本戳必须与所用宿主 SDK 一致。
  *
- * @ccgui/plugin-sdk v0.3.23
+ * @ccgui/plugin-sdk v0.3.26
  */
 
 /** 宿主实现的 SDK 契约版本。 */
@@ -14,6 +14,13 @@ export declare const SDK_VERSION: string;
 
 /** 每次注册的撤销句柄；卸载时逆序执行。 */
 export type Disposer = () => void;
+
+/** The clicked file link. run is dispatched only with a resolvedPath. */
+export interface FileLinkMenuTarget {
+  readonly path: string;
+  readonly resolvedPath: string | null;
+  readonly workspacePath: string;
+}
 
 export type PluginConversationProps = {
   conversationId: string;
@@ -161,6 +168,121 @@ export interface PluginModelCatalogError {
   engine: string;
   sourceId?: string;
   message: string;
+}
+
+/** 用量统计（权限 `usage.read`，0.3.25 起）：宿主从本机各 CLI 自己的会话日志
+ *  增量计算，只读、不联网（`updatePrices` 除外，它只下载公开价格表）。
+ *  日期均为宿主本地日期 `YYYY-MM-DD`，时区由宿主运行时代填。 */
+export type UsageStatsBucket = "day" | "hour";
+export interface UsageStatsQuery {
+  /** 起始本地日期（含）。 */
+  from: string;
+  /** 结束本地日期（含）。 */
+  to: string;
+  /** 缺省 "day"；"hour" 的 bucket 形如 `2026-10-27T14`。 */
+  bucket?: UsageStatsBucket;
+}
+export interface UsageStatRow {
+  /** `2026-10-27`（day）或 `2026-10-27T14`（hour），本地时间。 */
+  bucket: string;
+  /** 引擎 id：claude / codex / pi / omp …（随宿主支持的日志格式增加）。 */
+  engine: string;
+  model: string;
+  /** 会话的工作目录（cwd）；日志里没有时为 null。 */
+  project: string | null;
+  /** 该分组里出现的不同会话数（跨分组相加会重复计）。 */
+  sessions: number;
+  /** 模型响应次数。 */
+  requests: number;
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheWrite: number;
+  /** 推理 tokens，已包含在 output 里，单列仅供参考。 */
+  reasoning: number;
+  /** 按价格表估算的美元费用；价格表里查不到该模型时为 null。 */
+  cost: number | null;
+}
+export interface UsageStatsResult {
+  rows: UsageStatRow[];
+  /** 全部数据里最早有用量的本地日期。 */
+  firstDay: string | null;
+  /** 最近一次扫描完成时间（epoch ms）。 */
+  scannedAt: number | null;
+  /** 正在扫描时为 true，此时 rows 是扫描前的数据。 */
+  scanning: boolean;
+  /** rows 中没有价格的模型。 */
+  unknownModels: string[];
+}
+export type UsageSourceState = "ok" | "missing" | "denied" | "error";
+export interface UsageSourceStatus {
+  engine: string;
+  label: string;
+  /** 扫描的根目录（已展开环境变量覆盖）。 */
+  roots: string[];
+  /** 可覆盖根目录的环境变量名。 */
+  env: string | null;
+  files: number;
+  status: UsageSourceState;
+  error: string | null;
+  lastScanAt: number | null;
+}
+export interface UsageScanSummary {
+  filesScanned: number;
+  eventsAdded: number;
+  durationMs: number;
+  scannedAt: number;
+}
+export interface UsageScanProgress {
+  done: number;
+  total: number;
+  engine: string | null;
+  finished: boolean;
+}
+export interface UsagePriceInfo {
+  source: "bundled" | "online";
+  /** 内置快照日期 `YYYY-MM-DD`。 */
+  snapshotDate: string;
+  /** 在线价格表的下载时间（epoch ms）；从未更新为 null。 */
+  updatedAt: number | null;
+  models: number;
+}
+
+/** 订阅限额（权限 `limits.read`，0.3.25 起）：宿主只读本机 CLI 的登录状态，
+ *  只请求厂商官方接口，不刷新、不改写任何凭据；插件拿不到凭据。 */
+export type UsageLimitProviderId = "claude" | "codex";
+export type UsageLimitStatus = "ok" | "signedOut" | "expired" | "rateLimited" | "offline" | "error";
+export interface UsageLimitWindow {
+  /** five_hour / seven_day / seven_day_opus / seven_day_sonnet / scoped:<model> / session / weekly */
+  id: string;
+  kind: "session" | "weekly" | "other";
+  /** 模型级窗口的模型显示名；其他为 null。 */
+  label: string | null;
+  /** 已用百分比 0–100。 */
+  usedPercent: number;
+  windowSeconds: number | null;
+  /** 重置时间（epoch ms）。 */
+  resetsAt: number | null;
+}
+export interface UsageLimitProvider {
+  id: UsageLimitProviderId;
+  status: UsageLimitStatus;
+  plan: string | null;
+  /** rateLimited / offline 时保留上一次成功的数据。 */
+  windows: UsageLimitWindow[];
+  /** 额外用量（Extra usage），账号未开启时为 null。 */
+  extra: { usedUsd: number; limitUsd: number } | null;
+  /** 所示数据的获取时间（epoch ms）。 */
+  fetchedAt: number | null;
+  /** rateLimited 时下一次自动重试的时间（epoch ms）。 */
+  retryAt: number | null;
+  /** 简短原因，不含凭据。 */
+  error: string | null;
+  /** 查询的官方接口主机名，用于提示文案。 */
+  host: string;
+}
+export interface UsageLimitsResult {
+  providers: UsageLimitProvider[];
 }
 
 /** 信任层级（ADR-1）：declarative = 零 JS 声明式。 */
@@ -579,6 +701,15 @@ export interface PluginContext {
       keywords?: () => string[];
       run: () => void;
     }): Disposer;
+    /** Chat file-link actions before the external editor (ui:file-link-menu, 0.3.23). */
+    registerFileLinkMenuItem(def: {
+      key?: string;
+      label: (target: FileLinkMenuTarget) => string;
+      icon?: ComponentLike<{ className?: string }>;
+      visible?: (target: FileLinkMenuTarget) => boolean;
+      run: (target: FileLinkMenuTarget) => void | Promise<void>;
+      order?: number;
+    }): Disposer;
     /** 侧栏会话右键菜单追加行（权限 ui:session-menu，0.3.5 起）；
      *  run 收到打开菜单的会话。 */
     registerSessionMenuItem(def: {
@@ -694,8 +825,15 @@ export interface PluginContext {
      *  `usage://done`（0.3.8 起，引擎 done 事件透传，data.usage 携带
      *  该轮最终用量——claude/grok 等只经 Done 上报用量的引擎由此对插件
      *  可见）；`session://activated`（0.3.8 起，活动会话切换，payload
-     *  `{ engine, sessionId }`，pending 标签 sessionId 为 null，无活动
-     *  标签时两者皆 null）；`composer://draft`（payload { text }，草稿
+     *  `{ engine, sessionId, provider, model }`——provider/model 自 0.3.24 起：
+     *  provider 为会话所用渠道 id，引擎使用自身配置时为 null；model 为输入框
+     *  显示的模型（picker 选择器如 `deepseek/deepseek-flash`，或引擎回报的
+     *  实际模型），CLI 默认且无记录时为 null；pending 标签 sessionId 为
+     *  null，无活动标签时全为 null）；`session://selection-changed`（0.3.24
+     *  起，当前会话的 provider/model 变化时发出，无论来自输入框选择、设置页
+     *  改默认渠道、历史加载、其他窗口还是引擎回报；同值不重发，切换会话只发
+     *  activated；payload 同上，activated 的保留值同步更新）；
+     *  `composer://draft`（payload { text }，草稿
      *  变化/清空/会话切换均发射）。
      *
      *  `genMs`（0.3.15 起，仅 `usage`/`done` 携带）：该报告对应的宿主实测
@@ -784,6 +922,8 @@ export interface PluginContext {
    *  engine/sessionId/workspacePath 的外部行被丢弃。返回 Disposer,插件
    *  卸载时自动注销。 */
   sessions: {
+    /** 是否支持续接已有原生会话（0.3.26 起）；旧宿主不提供此标记。 */
+    readonly supportsResume: boolean;
     selectSession(engine: string, sessionId: string, workspacePath: string): Promise<void>;
     /** 请求宿主立即刷新会话目录（侧栏/标签页），0.3.7 起。
      *  插件绕过宿主直写会话数据（如 sqlite custom_title、转录 title 行）后
@@ -796,7 +936,9 @@ export interface PluginContext {
     /** 把一个 AI 轮次跑成**宿主聊天会话**(0.3.18 起,权限 host:session):
      *  会话立刻出现在侧栏(带运行中状态,不需要手动同步),打开就是实时流式
      *  输出;停止既能在聊天里点,也能用 interruptRun。会话挂在 workspacePath
-     *  工作区下,模型/强度/渠道只覆盖这一轮,不动用户的全局默认。
+     *  工作区下；新建轮次可覆盖模型/强度/渠道，不动用户的全局默认，续接轮次沿用已有会话的选择。
+     *  续接忽略 model / effort / providerId 覆盖，并切回该会话；只应由用户
+     *  主动操作触发，不用于定时或后台任务。
      *
      *  与 ctx.agent.start 的分工:那个是插件自有的后台轮次(事件只回插件,
      *  不进聊天);这个就是「像用户自己发了一条」。需要用户看得见、随时
@@ -807,6 +949,12 @@ export interface PluginContext {
      *  { runId, sessionId, engine, workspacePath, kind: "done" | "error", error }。
      *  被用户/插件中断的轮次同样以 done 收尾。 */
     startRun(def: {
+      /** 0.3.26 起：续接已有原生会话；省略或 null 时创建新会话。
+       * 引擎与工作区必须匹配；正在运行或加载、目标不存在、历史读取失败时拒绝，
+       * 不创建替代会话。宿主切回聊天并恢复历史后发送，沿用会话的模型、渠道与推理强度，
+       * 忽略本轮 model / effort / providerId 覆盖。续接只应由用户主动操作触发，
+       * 不应用于定时或后台任务，以免切走用户当前画面。 */
+      sessionId?: string | null;
       engine: string;
       prompt: string;
       /** 会话所属工作区路径(如某个 worktree)。 */
@@ -818,26 +966,15 @@ export interface PluginContext {
       /** 本轮渠道 id(catalog 的 providers[].id)。 */
       providerId?: string | null;
     }): Promise<{ runId: string; sessionId: string | null }>;
-    /** 停止 startRun 起的轮次(等价于聊天里的停止按钮)。只允许停止本插件
-     *  startRun 起的、仍在运行的轮次：没有匹配的在跑轮次会以 rejection 失败，
-     *  不会误停用户或其他插件的会话；`sessionId: null` 匹配本插件在该引擎+工作
-     *  区里的任意在跑轮次（原生 id 可能在 startRun 返回后才 announce）。 */
+    /** 停止本插件通过 startRun 启动的在跑轮次（等价于聊天里的停止按钮）。
+     *  省略 sessionId 或传 null 时，停止本插件在该引擎与工作区下的全部在跑轮次；
+     *  提供 ID 时去除首尾空白并停止匹配的会话，拒绝空白 ID。
+     *  尚未获得原生会话 ID 时按轮次 ID 停止。无匹配轮次时拒绝。 */
     interruptRun(def: {
       engine: string;
       workspacePath: string;
       sessionId?: string | null;
     }): Promise<void>;
-    /** 向明确指定的已有会话发送消息(权限 host:session:send)。不会创建
-     *  会话,也不会读取当前活动标签页。目标忙碌时 queue 按会话顺序等待,
-     *  reject 立即以 busy 拒绝。返回 runId 并通过 plugin-run://<pluginId>
-     *  回执 started/done/error/cancelled。 */
-    sendMessage(def: {
-      engine: string;
-      sessionId: string;
-      workspacePath: string;
-      prompt: string;
-      ifBusy?: "queue" | "reject";
-    }): Promise<{ runId: string; sessionId: string }>;
     registerSource(def: {
       /** 源 id,插件内唯一;同 id 重复登记覆盖(热重载语义)。 */
       id: string;
@@ -863,6 +1000,31 @@ export interface PluginContext {
       workspace?: string;
       refreshProviders?: boolean;
     }): Promise<PluginModelCatalogResult>;
+  };
+  /** 本机用量统计（权限 `usage.read`，0.3.25 起）。数据由宿主从各 CLI 的会话
+   *  日志计算，不上传。refresh 增量读取新内容；rescan 从头重读磁盘上全部日志
+   *  （进度经 onScanProgress），已被 CLI 清理的旧日志对应的用量保留不丢，
+   *  60 秒内重复调用会被拒绝。updatePrices 下载公开价格表（LiteLLM），应只在
+   *  用户开启自动更新或显式操作时调用；10 分钟内重复调用直接返回当前价格表。
+   *  宿主在插件首次调用后才开始后台扫描，约 10 分钟无调用即停止。 */
+  usage: {
+    query(query: UsageStatsQuery): Promise<UsageStatsResult>;
+    sources(): Promise<UsageSourceStatus[]>;
+    refresh(): Promise<UsageScanSummary>;
+    rescan(): Promise<UsageScanSummary>;
+    prices(): Promise<UsagePriceInfo>;
+    updatePrices(): Promise<UsagePriceInfo>;
+    onChange(cb: (event: { scannedAt: number }) => void): Disposer;
+    onScanProgress(cb: (progress: UsageScanProgress) => void): Disposer;
+  };
+  /** 订阅限额（权限 `limits.read`，0.3.25 起）。缺省查询全部平台；宿主缓存
+   *  60 秒，refresh 跳过缓存但 20 秒内重复刷新仍复用上次结果，并遵守 429
+   *  退避。 */
+  limits: {
+    get(options?: {
+      providers?: UsageLimitProviderId[];
+      refresh?: boolean;
+    }): Promise<UsageLimitsResult>;
   };
   /** Agent 轮次（权限 `agent`，0.3.13 起）：经宿主引擎管线拉起 agent
    *  进程——渠道注入、进程注册与聊天发送同构。事件经 `agent://<pluginId>`

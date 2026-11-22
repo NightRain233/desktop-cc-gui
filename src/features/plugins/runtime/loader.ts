@@ -4,6 +4,7 @@ import i18n from "@/lib/i18n";
 import { buildAgentCatalog } from "../conversation/agent-catalog";
 import { APP_VERSION } from "@/version/app-version";
 import { invoke } from "@/lib/transport";
+import { ipcUsageBackend } from "./usage-bridge";
 import { useChatStore } from "@/features/chat/store";
 import {
   createPluginContext,
@@ -13,7 +14,6 @@ import {
 } from "./context";
 import { bridgePluginAgentEvents, bridgeUsageEvents } from "./events";
 import { installHardening, runAsPlugin } from "./hardening";
-import { cancelPluginSessionRuns } from "./session-run-bridge";
 import { validateManifest } from "./permissions";
 import { applyDeclarativePlugin } from "../declarative/interpreter";
 import {
@@ -57,6 +57,7 @@ export interface LoaderBackend extends PluginContextBackend {
 }
 
 export const ipcBackend: LoaderBackend = {
+  ...ipcUsageBackend,
   agentCatalog: (workspacePath) => buildAgentCatalog(ipc, workspacePath, (key) => i18n.t(key)),
   windowGetState: (pluginId) => invoke("plugin_window_state", { pluginId }),
   windowSetNormalBounds: (pluginId, bounds) =>
@@ -340,7 +341,6 @@ export function unloadPlugin(id: string): void {
   const entry = active.get(id);
   if (!entry) return;
   active.delete(id);
-  cancelPluginSessionRuns(id);
   if (entry.cleanup) {
     try {
       runAsPlugin(entry.cleanup);

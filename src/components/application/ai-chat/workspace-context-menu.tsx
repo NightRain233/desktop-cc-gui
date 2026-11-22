@@ -1,4 +1,5 @@
-import { useEffect } from "react";
+import { WorkspaceEngineDialog } from "@/features/chat/WorkspaceEngineDialog";
+import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import type { TFunction } from "i18next";
 import Archive from "lucide-react/dist/esm/icons/archive";
@@ -6,13 +7,18 @@ import ArchiveRestore from "lucide-react/dist/esm/icons/archive-restore";
 import FolderOpen from "lucide-react/dist/esm/icons/folder-open";
 import FolderPlus from "lucide-react/dist/esm/icons/folder-plus";
 import GitBranchPlus from "lucide-react/dist/esm/icons/git-branch-plus";
+import Link2 from "lucide-react/dist/esm/icons/link-2";
+import Cpu from "lucide-react/dist/esm/icons/cpu";
 import Pencil from "lucide-react/dist/esm/icons/pencil";
+import Pin from "lucide-react/dist/esm/icons/pin";
+import PinOff from "lucide-react/dist/esm/icons/pin-off";
 import Trash2 from "lucide-react/dist/esm/icons/trash-2";
 import Puzzle from "lucide-react/dist/esm/icons/puzzle";
 import { ContextMenu, type ContextMenuEntry } from "@/components/context-menu";
 import { useChatStore } from "@/features/chat/store";
 import { useWorktreeStore } from "@/features/worktree/store";
 import { ipc, worktreeMetaOf, type Workspace } from "@/lib/ipc";
+import { copyText } from "@/lib/clipboard";
 import {
   compareByOrder,
   pluginIdFromRegistryKey,
@@ -54,12 +60,14 @@ interface WorkspaceMenuEntriesOptions {
   t: TFunction;
   onSetAlias?: (workspaceId: string) => void;
   onSetArchived?: (workspaceId: string, archived: boolean) => void;
+  onSetPinned?: (workspaceId: string, pinned: boolean) => void;
   onNewWorktree?: (workspaceId: string) => void;
   onDeleteWorktree?: (workspaceId: string) => void;
 }
 
 /** Builds the row menu: worktree rows get reveal/delete, plain rows get the
- *  archive toggle; alias and new-worktree entries show whenever enabled. */
+ *  archive toggle; copy-path shows for every known workspace; alias and
+ *  new-worktree entries show whenever enabled. */
 function buildWorkspaceMenuEntries({
   menu,
   workspace,
@@ -68,6 +76,7 @@ function buildWorkspaceMenuEntries({
   t,
   onSetAlias,
   onSetArchived,
+  onSetPinned,
   onNewWorktree,
   onDeleteWorktree,
 }: WorkspaceMenuEntriesOptions): (ContextMenuEntry | "separator")[] {
@@ -86,6 +95,22 @@ function buildWorkspaceMenuEntries({
       label: t("chat.setWorkspaceAlias"),
       icon: <Pencil className="size-4" aria-hidden />,
       onSelect: () => onSetAlias(menu.workspaceId),
+    });
+  }
+  if (onSetPinned && workspace && !isWorktree && !menu.archived) {
+    entries.push({
+      id: "toggle-pin",
+      label: t(workspace.pinned ? "chat.unpinWorkspace" : "chat.pinWorkspace"),
+      icon: workspace.pinned ? <PinOff className="size-4" aria-hidden /> : <Pin className="size-4" aria-hidden />,
+      onSelect: () => onSetPinned(menu.workspaceId, !workspace.pinned),
+    });
+  }
+  if (workspace) {
+    entries.push({
+      id: "copy-path",
+      label: t("files.copyPath"),
+      icon: <Link2 className="size-4" aria-hidden />,
+      onSelect: () => void copyText(workspace.path),
     });
   }
   if (isWorktree && workspace) {
@@ -204,6 +229,7 @@ export function WorkspaceContextMenu({
   onClose,
   onSetAlias,
   onSetArchived,
+  onSetPinned,
   onNewWorktree,
   onDeleteWorktree,
 }: {
@@ -211,6 +237,7 @@ export function WorkspaceContextMenu({
   onClose: () => void;
   onSetAlias?: (workspaceId: string) => void;
   onSetArchived?: (workspaceId: string, archived: boolean) => void;
+  onSetPinned?: (workspaceId: string, pinned: boolean) => void;
   onNewWorktree?: (workspaceId: string) => void;
   onDeleteWorktree?: (workspaceId: string) => void;
 }) {
@@ -236,9 +263,23 @@ export function WorkspaceContextMenu({
     t,
     onSetAlias,
     onSetArchived,
+    onSetPinned,
     onNewWorktree,
     onDeleteWorktree,
   });
+  const [choosingEngine, setChoosingEngine] = useState(false);
+  if (workspace && !menu.archived) {
+    const destructiveIndex = builtins.findIndex((entry) =>
+      entry === "separator" || entry.id === "toggle-archive",
+    );
+    builtins.splice(destructiveIndex < 0 ? builtins.length : destructiveIndex, 0, {
+      id: "workspace-default-engine",
+      label: t("chat.workspaceDefaultEngine"),
+      icon: <Cpu className="size-4" aria-hidden />,
+      onSelect: () => setChoosingEngine(true),
+      keepOpen: true,
+    });
+  }
   const extensions = buildExtensionEntries(extensionDefs, target);
   const entries: (ContextMenuEntry | "separator")[] =
     builtins.length > 0 && extensions.length > 0
@@ -251,6 +292,9 @@ export function WorkspaceContextMenu({
   }, [entries.length, onClose]);
   if (entries.length === 0) return null;
 
+  if (choosingEngine && workspace) {
+    return <WorkspaceEngineDialog workspace={workspace} onClose={onClose} />;
+  }
   return (
     <ContextMenu
       x={menu.x}

@@ -52,6 +52,11 @@ impl Engine for ClaudeEngine {
         "claude"
     }
 
+    /// Every assistant snapshot names the model that produced it.
+    fn reports_served(&self) -> bool {
+        true
+    }
+
     fn supports_images(&self) -> bool {
         true
     }
@@ -60,6 +65,20 @@ impl Engine for ClaudeEngine {
     }
     fn supports_memory(&self) -> bool {
         true
+    }
+    /// 按需条目经私有文件交给 `--mcp-config`：同名时它覆盖用户/项目/本地
+    /// 作用域的定义（整条替换），只对这一次进程生效。`--mcp-config` 是可
+    /// 重复的列表参数，追加在末尾不会吞掉别的参数。
+    fn mount_on_demand(
+        &self,
+        built: &mut BuiltCommand,
+        servers: &[crate::mcp::launch::OnDemandServer],
+        _workspace: &std::path::Path,
+    ) -> Result<(), String> {
+        let path = crate::mcp::launch::stage_claude_config(servers, "claude-staging")?;
+        built.cleanup_files.push(path.clone());
+        built.command.arg("--mcp-config").arg(path);
+        Ok(())
     }
     fn supports_effort(&self) -> bool {
         true
@@ -71,6 +90,12 @@ impl Engine for ClaudeEngine {
     /// 只读工具约束：claude 的 plan 模式会拒绝一切编辑/命令，再叠加
     /// 逐次 --allowedTools 白名单与显式 --disallowedTools。
     fn supports_tool_constraints(&self) -> bool {
+        true
+    }
+
+    /// 零工具轮次：`--tools ""` 卸掉全部内置工具，`--strict-mcp-config`
+    /// 且不给 `--mcp-config` 就不连任何 MCP 服务器。
+    fn supports_no_tools(&self) -> bool {
         true
     }
 
@@ -96,7 +121,18 @@ impl Engine for ClaudeEngine {
         // (headless -p cannot prompt mid-turn, so anything not listed here
         // gets denied outright).
         let mut preapproved: Vec<&str> = Vec::new();
-        if let Some(tools) = req.allowed_tools.as_deref() {
+        if req.no_tools {
+            // 纯文本轮次（插件介绍翻译）：输入是不可信的第三方文本，模型手里
+            // 不能有任何工具。prepare_launch 已保证不带白名单/电脑操控/记忆，
+            // 所以下面的 --mcp-config / --allowedTools 都不会出现。会话不落盘：
+            // 这类轮次从不续接，也不该出现在历史里。
+            cmd.arg("--tools");
+            cmd.arg("");
+            cmd.arg("--strict-mcp-config");
+            cmd.arg("--permission-mode");
+            cmd.arg("default");
+            cmd.arg("--no-session-persistence");
+        } else if let Some(tools) = req.allowed_tools.as_deref() {
             // 任务工作台的只读约束：plan 模式拒绝任何编辑/命令，再叠加
             // 白名单；headless -p 下未列入 --allowedTools 的工具会被拒。
             // 已知写工具额外显式 deny，防止模式解析差异。
@@ -369,10 +405,7 @@ impl Engine for ClaudeEngine {
                 // text (headless cannot prompt). Surface them so the UI can
                 // offer a directory grant instead of letting the model
                 // narrate a terminal prompt that does not exist.
-                for (id, text) in tool_result_error_blocks(&value) {
-                    if !looks_like_permission_denial(&text) {
-                        continue;
-                    }
+                for (id, text) in tool_result_permission_denials(&value) {
                     // The denied call's structured input is authoritative:
                     // resolve the real path argument by tool_use id and only
                     // fall back to scraping the free-text error when the call
@@ -381,6 +414,9 @@ impl Engine for ClaudeEngine {
                     let tool = id
                         .as_ref()
                         .and_then(|id| self.tool_names.lock().ok()?.get(id).cloned());
+                    if is_question_tool(tool.as_deref()) {
+                        continue;
+                    }
                     let path = id
                         .as_ref()
                         .and_then(|id| self.tool_paths.lock().ok()?.get(id).cloned())
@@ -389,6 +425,7 @@ impl Engine for ClaudeEngine {
                         tool,
                         path,
                         message: text,
+                        tool_use_id: id,
                     });
                 }
                 // Tool result output emitted in response to tool_use. The
@@ -402,20 +439,6 @@ impl Engine for ClaudeEngine {
                 {
                     for block in content {
                         if block.get("type").and_then(Value::as_str) == Some("tool_result") {
-                            // Error blocks are surfaced as permission denials
-                            // above (or narrated by the model); denial-shaped
-                            // text without is_error stays silent for the same
-                            // reason. Keep both out of the timeline panel to
-                            // avoid double-reporting.
-                            if block
-                                .get("is_error")
-                                .and_then(Value::as_bool)
-                                .unwrap_or(false)
-                                || looks_like_permission_denial(&tool_result_block_text(block))
-                            {
-                                continue;
-                            }
-                            let res = value.get("toolUseResult").or_else(|| block.get("content"));
                             let tool_call_id = block.get("tool_use_id").and_then(Value::as_str);
                             let name = tool_call_id
                                 .and_then(|id| {
@@ -425,6 +448,23 @@ impl Engine for ClaudeEngine {
                                         .and_then(|map| map.get(id).cloned())
                                 })
                                 .unwrap_or_default();
+                            // Error blocks are surfaced as permission denials
+                            // above (or narrated by the model); denial-shaped
+                            // text without is_error stays silent for the same
+                            // reason. Keep both out of the timeline panel to
+                            // avoid double-reporting — but the call is over
+                            // (a failed command is is_error), so tell the
+                            // run-activity panel to stop listing it as running.
+                            if block
+                                .get("is_error")
+                                .and_then(Value::as_bool)
+                                .unwrap_or(false)
+                                || is_claude_permission_denial(&tool_result_block_text(block))
+                            {
+                                out.push(super::tool_settled(name, tool_call_id));
+                                continue;
+                            }
+                            let res = value.get("toolUseResult").or_else(|| block.get("content"));
                             out.push(super::tool_result_patch_with_id(name, res, tool_call_id));
                         }
                     }
@@ -459,12 +499,22 @@ impl Engine for ClaudeEngine {
                             .map(str::trim)
                             .filter(|t| !t.is_empty())
                             .map(str::to_string);
+                        if is_question_tool(tool.as_deref()) {
+                            continue;
+                        }
                         let path = denial.get("tool_input").and_then(super::tool_path_arg);
+                        let tool_use_id = denial
+                            .get("tool_use_id")
+                            .and_then(Value::as_str)
+                            .map(str::trim)
+                            .filter(|id| !id.is_empty())
+                            .map(str::to_string);
                         if tool.is_some() || path.is_some() {
                             out.push(EngineEvent::PermissionDenied {
                                 tool,
                                 path,
                                 message: String::new(),
+                                tool_use_id,
                             });
                         }
                     }
@@ -503,8 +553,10 @@ impl Engine for ClaudeEngine {
             }
             "control_request" => {
                 // SDK control protocol asks. AskUserQuestion surfaces to the
-                // UI; every other ask is denied in place (this client has no
-                // approval card), preserving the old headless behavior.
+                // UI; every other ask is answered in place (deny for tool
+                // permissions, decline for MCP elicitation, error for
+                // anything unrecognized) — every request must get exactly
+                // one response or the CLI parks on it forever.
                 let request = value.get("request");
                 let subtype = request
                     .and_then(|r| r.get("subtype"))
@@ -541,6 +593,18 @@ impl Engine for ClaudeEngine {
                             tool_name,
                         });
                     }
+                } else if subtype == "elicitation" {
+                    // MCP elicitation (form input / confirmation from an MCP
+                    // server). No form UI here: decline so the MCP tool call
+                    // settles instead of hanging the turn (issue #1432).
+                    out.push(EngineEvent::ElicitationDecline {
+                        request_id: request_id.to_string(),
+                    });
+                } else {
+                    out.push(EngineEvent::ControlRequestError {
+                        request_id: request_id.to_string(),
+                        subtype: subtype.to_string(),
+                    });
                 }
             }
             "control_cancel_request" => {
@@ -624,27 +688,20 @@ fn compact_usage(post_tokens: i64, raw: Option<&Value>) -> Value {
     usage
 }
 
-/// Phrases the CLI uses when a tool call is denied by the permission
-/// system in headless mode (matched case-insensitively against the
-/// tool_result error text).
-const DENIAL_PHRASES: &[&str] = &[
-    "requested permissions",
-    "haven't granted it yet",
-    "have not granted it yet",
-    "requires approval",
-    "requires permission",
-    "permission denied",
-    "blocked for security",
-    "blocked. for security",
-    "allowed working directories",
-    "may only write to files",
-    "outside the allowed",
-    "outside workspace",
-];
+/// A declined or skipped question is the user's own answer, not a permission
+/// the user could grant here: never surface it as a grant card (CodeBuddy
+/// lists a declined AskUserQuestion in the result's `permission_denials`).
+fn is_question_tool(tool: Option<&str>) -> bool {
+    tool == Some("AskUserQuestion")
+}
 
-fn looks_like_permission_denial(message: &str) -> bool {
-    let normalized = message.trim().to_ascii_lowercase();
-    !normalized.is_empty() && DENIAL_PHRASES.iter().any(|p| normalized.contains(p))
+fn is_claude_permission_denial(message: &str) -> bool {
+    // Tool output can contain OS errors or arbitrary prose. Match the known
+    // Claude refusal template here; other denials use result.permission_denials.
+    let normalized = message.trim().trim_end_matches('.').to_ascii_lowercase();
+    normalized.starts_with("claude requested permissions to ")
+        && (normalized.ends_with(", but you haven't granted it yet")
+            || normalized.ends_with(", but you have not granted it yet"))
 }
 
 /// First absolute-path-looking token in free text: Windows `C:\…` / `C:/…`
@@ -687,9 +744,8 @@ fn tool_result_block_text(block: &Value) -> String {
     }
 }
 
-/// (tool_use id, error text) pairs of tool_result blocks in a "user" stream
-/// line. Content may be a plain string or an array of text blocks.
-fn tool_result_error_blocks(value: &Value) -> Vec<(Option<String>, String)> {
+/// (tool_use id, denial text) pairs of tool_result blocks in a "user" stream line.
+fn tool_result_permission_denials(value: &Value) -> Vec<(Option<String>, String)> {
     let mut out = Vec::new();
     let Some(content) = value
         .get("message")
@@ -710,13 +766,12 @@ fn tool_result_error_blocks(value: &Value) -> Vec<(Option<String>, String)> {
             continue;
         }
         let text = tool_result_block_text(block);
-        let text = text.trim().chars().take(500).collect::<String>();
-        if !text.is_empty() {
+        if is_claude_permission_denial(&text) {
             let id = block
                 .get("tool_use_id")
                 .and_then(Value::as_str)
                 .map(str::to_string);
-            out.push((id, text));
+            out.push((id, text.trim().chars().take(500).collect()));
         }
     }
     out
@@ -739,7 +794,10 @@ fn format_api_retry(value: &Value) -> String {
         .map(str::trim)
         .filter(|e| !e.is_empty() && *e != "unknown");
     let mut msg = match value.get("error_status").and_then(Value::as_u64) {
-        Some(code) => format!("API error (HTTP {code})"),
+        Some(code) => match detail {
+            Some(detail) => format!("API error (HTTP {code}: {detail})"),
+            None => format!("API error (HTTP {code})"),
+        },
         None => match detail {
             Some(detail) => format!("API error: {detail}"),
             None => "API error".to_string(),
@@ -832,7 +890,19 @@ fn parse_content_block_start(
     let Some(block) = event.get("content_block") else {
         return;
     };
-    if block.get("type").and_then(Value::as_str) != Some("tool_use") {
+    let block_type = block.get("type").and_then(Value::as_str).unwrap_or("");
+    // Activity marker for the run-status panel: a thinking block can run for
+    // minutes without a single visible delta (omitted thinking display), and
+    // only its start tells the user the model is working rather than stalled.
+    out.push(EngineEvent::Block {
+        kind: Some(match block_type {
+            "thinking" | "redacted_thinking" => "thinking",
+            "text" => "text",
+            "tool_use" => "tool_input",
+            _ => "other",
+        }),
+    });
+    if block_type != "tool_use" {
         return;
     }
     let name = block
@@ -878,6 +948,7 @@ fn parse_content_block_stop(
     event: &Value,
     out: &mut Vec<EngineEvent>,
 ) {
+    out.push(EngineEvent::Block { kind: None });
     let Some(index) = event.get("index").and_then(Value::as_u64) else {
         return;
     };
@@ -1156,6 +1227,60 @@ mod tests {
     }
 
     #[test]
+    fn mcp_elicitation_control_request_declines_in_place() {
+        let line = serde_json::json!({
+            "type": "control_request",
+            "request_id": "req-elicit-1",
+            "request": {
+                "subtype": "elicitation",
+                "mcp_server_name": "elicit-demo",
+                "message": "Continue?",
+                "requested_schema": { "type": "object", "properties": { "ok": { "type": "boolean" } } }
+            }
+        })
+        .to_string();
+        let mut out = Vec::new();
+        ClaudeEngine::new().parse_line(&line, &mut out);
+        match &out[..] {
+            [EngineEvent::ElicitationDecline { request_id }] => {
+                assert_eq!(request_id, "req-elicit-1");
+            }
+            other => panic!("expected elicitation decline event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unknown_control_request_subtypes_error_in_place() {
+        let line = serde_json::json!({
+            "type": "control_request",
+            "request_id": "req-unknown-1",
+            "request": { "subtype": "future_ask", "payload": {} }
+        })
+        .to_string();
+        let mut out = Vec::new();
+        ClaudeEngine::new().parse_line(&line, &mut out);
+        match &out[..] {
+            [EngineEvent::ControlRequestError { request_id, subtype }] => {
+                assert_eq!(request_id, "req-unknown-1");
+                assert_eq!(subtype, "future_ask");
+            }
+            other => panic!("expected control error event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn control_request_without_id_is_ignored() {
+        let line = serde_json::json!({
+            "type": "control_request",
+            "request": { "subtype": "elicitation", "message": "Continue?" }
+        })
+        .to_string();
+        let mut out = Vec::new();
+        ClaudeEngine::new().parse_line(&line, &mut out);
+        assert!(out.is_empty(), "no request_id, nothing to answer: {out:?}");
+    }
+
+    #[test]
     fn stream_message_boundaries_open_and_close_the_generation_window() {
         let engine = ClaudeEngine::new();
         let start = serde_json::json!({
@@ -1189,8 +1314,9 @@ mod tests {
         .to_string();
         let mut out = Vec::new();
         ClaudeEngine::new().parse_line(&line, &mut out);
-        assert_eq!(out.len(), 1);
-        match &out[0] {
+        assert_eq!(out.len(), 2);
+        assert!(matches!(&out[0], EngineEvent::Block { kind: Some("tool_input") }));
+        match &out[1] {
             EngineEvent::Message {
                 role,
                 text,
@@ -1236,11 +1362,12 @@ mod tests {
         let mut out = Vec::new();
         engine.parse_line(&start, &mut out);
         engine.parse_line(&delta, &mut out);
-        assert_eq!(out.len(), 1);
+        assert_eq!(out.len(), 2, "block marker + name-only tool row");
         out.clear();
         engine.parse_line(&stop, &mut out);
-        assert_eq!(out.len(), 1);
-        match &out[0] {
+        assert_eq!(out.len(), 2);
+        assert!(matches!(&out[0], EngineEvent::Block { kind: None }));
+        match &out[1] {
             EngineEvent::Message {
                 text,
                 path,
@@ -1314,6 +1441,72 @@ mod tests {
         }
     }
 
+    /// Live wire: TaskCreate and TaskGet both answer with a `toolUseResult`
+    /// of `{task:{id,subject,...}}`. Only the creation names a new todo id;
+    /// reading a task must not patch the list (it used to reset it to pending).
+    #[test]
+    fn task_create_result_carries_the_id_and_task_get_patches_nothing() {
+        let engine = ClaudeEngine::new();
+        let start = |id: &str, name: &str| {
+            serde_json::json!({
+                "type": "stream_event",
+                "event": {
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": { "type": "tool_use", "id": id, "name": name, "input": {} }
+                }
+            })
+            .to_string()
+        };
+        let answer = |id: &str, envelope: Value, text: &str| {
+            serde_json::json!({
+                "type": "user",
+                "message": { "content": [
+                    { "type": "tool_result", "tool_use_id": id, "content": text }
+                ]},
+                "toolUseResult": envelope
+            })
+            .to_string()
+        };
+        let result_todos = |out: &[EngineEvent]| {
+            out.iter()
+                .find_map(|e| match e {
+                    EngineEvent::Message { patch: true, result: Some(_), todos, .. } => Some(todos.clone()),
+                    _ => None,
+                })
+                .expect("expected a tool result patch")
+        };
+
+        let mut out = Vec::new();
+        engine.parse_line(&start("toolu_c", "TaskCreate"), &mut out);
+        out.clear();
+        engine.parse_line(
+            &answer(
+                "toolu_c",
+                serde_json::json!({"task": {"id": "1", "subject": "A"}}),
+                "Task #1 created successfully: A",
+            ),
+            &mut out,
+        );
+        let created = result_todos(&out).expect("TaskCreate result is a todo fact");
+        assert_eq!(created.items[0].id.as_deref(), Some("1"));
+        assert_eq!(created.items[0].content, "A");
+
+        out.clear();
+        engine.parse_line(&start("toolu_g", "TaskGet"), &mut out);
+        out.clear();
+        engine.parse_line(
+            &answer(
+                "toolu_g",
+                serde_json::json!({"task": {"id": "1", "subject": "A", "description": "",
+                    "status": "completed", "blocks": [], "blockedBy": []}}),
+                "Task #1: A\nStatus: completed\nDescription: ",
+            ),
+            &mut out,
+        );
+        assert!(result_todos(&out).is_none(), "TaskGet must not patch the todo list");
+    }
+
     #[test]
     fn api_retry_system_event_reports_progress_without_settling() {
         let line = serde_json::json!({
@@ -1367,7 +1560,7 @@ mod tests {
     }
 
     #[test]
-    fn text_block_start_emits_nothing() {
+    fn text_block_start_emits_only_the_activity_marker() {
         let line = serde_json::json!({
             "type": "stream_event",
             "event": {
@@ -1379,7 +1572,26 @@ mod tests {
         .to_string();
         let mut out = Vec::new();
         ClaudeEngine::new().parse_line(&line, &mut out);
-        assert!(out.is_empty());
+        // No timeline content, only the run-activity marker.
+        assert_eq!(out.len(), 1);
+        assert!(matches!(&out[0], EngineEvent::Block { kind: Some("text") }));
+    }
+
+    #[test]
+    fn thinking_block_start_marks_silent_thinking() {
+        let line = serde_json::json!({
+            "type": "stream_event",
+            "event": {
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": { "type": "thinking", "thinking": "" }
+            }
+        })
+        .to_string();
+        let mut out = Vec::new();
+        ClaudeEngine::new().parse_line(&line, &mut out);
+        assert_eq!(out.len(), 1);
+        assert!(matches!(&out[0], EngineEvent::Block { kind: Some("thinking") }));
     }
 
     #[test]
@@ -1402,12 +1614,17 @@ mod tests {
         .to_string();
         let mut out = Vec::new();
         ClaudeEngine::new().parse_line(&line, &mut out);
-        assert_eq!(out.len(), 1);
+        assert_eq!(out.len(), 2, "the denial card plus the call's activity settle marker");
+        assert!(matches!(
+            &out[1],
+            EngineEvent::ToolSettled { tool_call_id: Some(id), .. } if id == "toolu_1"
+        ));
         match &out[0] {
             EngineEvent::PermissionDenied {
                 tool,
                 path,
                 message,
+                ..
             } => {
                 assert_eq!(*tool, None);
                 assert_eq!(path.as_deref(), Some(r"C:\dev\frontend"));
@@ -1466,9 +1683,15 @@ mod tests {
             .find(|e| matches!(e, EngineEvent::PermissionDenied { .. }))
             .expect("expected permission denial");
         match denial {
-            EngineEvent::PermissionDenied { tool, path, .. } => {
+            EngineEvent::PermissionDenied {
+                tool,
+                path,
+                tool_use_id,
+                ..
+            } => {
                 assert_eq!(tool.as_deref(), Some("Read"));
                 assert_eq!(path.as_deref(), Some("/etc/hosts"));
+                assert_eq!(tool_use_id.as_deref(), Some("toolu_9"));
             }
             _ => unreachable!(),
         }
@@ -1482,6 +1705,16 @@ mod tests {
                 "Claude requested permissions to read from /etc, but you haven't granted it yet.",
             ),
             (true, "file not found: /tmp/missing.txt"),
+            (true, "mv: /tmp/a: Permission denied"),
+            (true, "permission denied: docker"),
+            (
+                true,
+                "Exit code 1\nThe operation requires approval outside workspace",
+            ),
+            (
+                true,
+                "Exit code 1\nClaude requested permissions to run Bash, but you haven't granted it yet.",
+            ),
         ] {
             let line = serde_json::json!({
                 "type": "user",
@@ -1498,8 +1731,85 @@ mod tests {
             .to_string();
             let mut out = Vec::new();
             ClaudeEngine::new().parse_line(&line, &mut out);
-            assert!(out.is_empty(), "is_error={is_error} text={text}");
+            // Nothing for the timeline: only the activity marker that ends the call.
+            assert!(
+                matches!(
+                    &out[..],
+                    [EngineEvent::ToolSettled { tool_call_id: Some(id), .. }] if id == "toolu_1"
+                ),
+                "is_error={is_error} text={text} out={out:?}"
+            );
         }
+    }
+
+    #[test]
+    fn failed_tool_result_ends_the_call_in_run_activity() {
+        // A failing command comes back as an is_error tool_result (real
+        // transcripts: "Exit code 1\n…"). The timeline skips it, but the
+        // run-activity panel must not keep listing the call as running.
+        let engine = ClaudeEngine::new();
+        let id = "claude-failed-tool-activity";
+        let lines = [
+            serde_json::json!({"type": "stream_event", "event": {"type": "message_start", "message": {}}}),
+            serde_json::json!({"type": "stream_event", "event": {
+                "type": "content_block_start", "index": 0,
+                "content_block": {"type": "tool_use", "id": "toolu_f", "name": "Bash", "input": {}}
+            }}),
+            serde_json::json!({"type": "stream_event", "event": {
+                "type": "content_block_delta", "index": 0,
+                "delta": {"type": "input_json_delta", "partial_json": "{\"command\":\"pnpm test\"}"}
+            }}),
+            serde_json::json!({"type": "stream_event", "event": {"type": "content_block_stop", "index": 0}}),
+            serde_json::json!({"type": "stream_event", "event": {"type": "message_stop"}}),
+        ];
+        let mut feed = |line: &Value| {
+            let mut out = Vec::new();
+            engine.parse_line(&line.to_string(), &mut out);
+            for event in &out {
+                super::super::activity::observe(id, "claude", event);
+            }
+        };
+        for line in &lines {
+            feed(line);
+        }
+        let running = super::super::activity::snapshot(&[id.to_string()]);
+        assert_eq!(running[0].tools.len(), 1, "the command is running");
+        feed(&serde_json::json!({"type": "user", "message": {"role": "user", "content": [{
+            "type": "tool_result", "tool_use_id": "toolu_f", "is_error": true,
+            "content": "Exit code 1\nFAIL"
+        }]}}));
+        let settled = super::super::activity::snapshot(&[id.to_string()]);
+        super::super::activity::end(id);
+        assert!(settled[0].tools.is_empty(), "a failed command is no longer running");
+    }
+
+    #[test]
+    fn successful_tool_output_with_permission_language_reaches_the_tool_row() {
+        let text = "permission denied and requires approval are examples in this file";
+        let line = serde_json::json!({
+            "type": "user",
+            "message": { "content": [{
+                "type": "tool_result",
+                "tool_use_id": "toolu_1",
+                "is_error": false,
+                "content": text
+            }] }
+        })
+        .to_string();
+        let mut out = Vec::new();
+        ClaudeEngine::new().parse_line(&line, &mut out);
+        assert!(
+            matches!(
+                out.as_slice(),
+                [EngineEvent::Message {
+                    patch: true,
+                    tool_call_id: Some(id),
+                    result: Some(Value::String(result)),
+                    ..
+                }] if id == "toolu_1" && result == text
+            ),
+            "{out:?}"
+        );
     }
 
     #[test]
@@ -1520,13 +1830,81 @@ mod tests {
         ClaudeEngine::new().parse_line(&line, &mut out);
         assert_eq!(out.len(), 2);
         match &out[0] {
-            EngineEvent::PermissionDenied { tool, path, .. } => {
+            // The same call's mid-turn copy carries this id too: the
+            // frontend matches the two by it.
+            EngineEvent::PermissionDenied {
+                tool,
+                path,
+                tool_use_id,
+                ..
+            } => {
                 assert_eq!(tool.as_deref(), Some("Read"));
                 assert_eq!(path.as_deref(), Some("/Users/x/secrets/key.pem"));
+                assert_eq!(tool_use_id.as_deref(), Some("toolu_1"));
             }
             _ => panic!("expected permission denial"),
         }
         assert!(matches!(out[1], EngineEvent::Done { .. }));
+    }
+
+    /// A declined AskUserQuestion is the user's answer, not a grantable
+    /// permission. CodeBuddy 2.179 lists it in `permission_denials` (shape
+    /// copied from a real run) and its mid-turn result reads "Permission
+    /// denied by SDK"; neither may raise a "permission required" card.
+    #[test]
+    fn declined_question_never_surfaces_as_permission_denial() {
+        let engine = ClaudeEngine::new();
+        let start = serde_json::json!({
+            "type": "stream_event",
+            "event": {
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {
+                    "type": "tool_use", "id": "call_ask_1", "name": "AskUserQuestion", "input": {}
+                }
+            }
+        })
+        .to_string();
+        let stop = serde_json::json!({
+            "type": "stream_event",
+            "event": { "type": "content_block_stop", "index": 0 }
+        })
+        .to_string();
+        let declined = serde_json::json!({
+            "type": "user",
+            "message": {
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "call_ask_1",
+                    "is_error": true,
+                    "content": [{ "type": "text", "text": "Permission denied by SDK" }]
+                }]
+            }
+        })
+        .to_string();
+        let result = serde_json::json!({
+            "type": "result",
+            "subtype": "success",
+            "is_error": false,
+            "session_id": "s-1",
+            "permission_denials": [{
+                "tool_name": "AskUserQuestion",
+                "tool_use_id": "call_ask_1",
+                "tool_input": { "questions": [{ "question": "Which color?", "header": "Color" }] }
+            }]
+        })
+        .to_string();
+        let mut out = Vec::new();
+        for line in [&start, &stop, &declined, &result] {
+            engine.parse_line(line, &mut out);
+        }
+        assert!(
+            !out.iter()
+                .any(|e| matches!(e, EngineEvent::PermissionDenied { .. })),
+            "declined question surfaced as a permission denial: {out:?}"
+        );
+        assert!(matches!(out.last(), Some(EngineEvent::Done { .. })));
     }
 
     #[test]
@@ -1784,6 +2162,7 @@ mod tests {
             computer_use: None,
             memory_bot: None,
             allowed_tools: None,
+            no_tools: false,
         };
         let built = engine.build_command(&request, "claude").unwrap();
         let args: Vec<String> = built
@@ -1836,6 +2215,7 @@ mod tests {
             computer_use: None,
             memory_bot: None,
             allowed_tools: Some(vec!["Read".into(), "Grep".into()]),
+            no_tools: false,
         };
         let built = engine.build_command(&request, "claude").unwrap();
         let args: Vec<String> = built

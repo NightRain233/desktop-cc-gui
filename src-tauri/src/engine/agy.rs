@@ -1,5 +1,5 @@
 use super::{
-    command_for_binary, parse_tool_args_value, safe_prompt_arg, tool_call_message,
+    command_for_binary, images, parse_tool_args_value, safe_prompt_arg, tool_call_message,
     tool_result_patch, BuiltCommand, Engine, EngineEvent, SendRequest,
 };
 use serde_json::Value;
@@ -44,7 +44,7 @@ impl Engine for AgyEngine {
     }
 
     fn supports_images(&self) -> bool {
-        false
+        true
     }
     fn supports_effort(&self) -> bool {
         true
@@ -110,6 +110,17 @@ impl Engine for AgyEngine {
             cmd.arg("--add-dir");
             cmd.arg(dir);
         }
+        for raw in &req.images {
+            if let Some(path) = images::absolutize_image_path(raw, &req.workspace) {
+                if let Some(parent) = path.parent() {
+                    let parent_str = parent.to_string_lossy();
+                    if !parent_str.is_empty() && seen_dirs.insert(parent_str.to_string()) {
+                        cmd.arg("--add-dir");
+                        cmd.arg(parent.as_os_str());
+                    }
+                }
+            }
+        }
 
         if let Some(session_id) = req
             .session_id
@@ -121,10 +132,11 @@ impl Engine for AgyEngine {
             cmd.arg(session_id);
         }
 
+        let prompt_text = images::agy_prompt_with_images(&req.prompt, &req.images, &req.workspace);
         // `--print` is a string flag: the next token is the prompt. Keep it last
         // so a following option can never be swallowed as the prompt value.
         cmd.arg("--print");
-        cmd.arg(safe_prompt_arg(&req.prompt));
+        cmd.arg(safe_prompt_arg(&prompt_text));
 
         Ok(BuiltCommand {
             command: cmd,
@@ -171,7 +183,11 @@ fn effort_flag<'a>(requested: Option<&'a str>, model: &str) -> Option<&'a str> {
 
 fn model_encodes_effort(model: &str) -> bool {
     let lower = model.to_ascii_lowercase();
-    lower.ends_with("-high") || lower.ends_with("-medium") || lower.ends_with("-low")
+    lower.ends_with("-high")
+        || lower.ends_with("-xhigh")
+        || lower.ends_with("-max")
+        || lower.ends_with("-medium")
+        || lower.ends_with("-low")
 }
 
 fn event_name(value: &Value) -> &str {
@@ -202,7 +218,15 @@ fn push_conversation_id(value: &Value, out: &mut Vec<EngineEvent>) {
 }
 
 fn parse_step_update(step: &Value, out: &mut Vec<EngineEvent>) {
-    if let Some(delta) = string_field(step, "text_delta") {
+    // Deltas are verbatim stream chunks: whitespace at either edge is real
+    // content (the space in `## `, list/table newlines, code indentation) and
+    // splitting can land anywhere, so trimming here glues markdown together
+    // (upstream #1427/#1387). Only drop the delta when it is entirely empty.
+    if let Some(delta) = step
+        .get("text_delta")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+    {
         out.push(EngineEvent::Delta(delta.to_string()));
     }
     let Some(tool) = step.get("tool_info").filter(|v| v.is_object()) else {
@@ -277,6 +301,7 @@ mod tests {
             computer_use: None,
             memory_bot: None,
             allowed_tools: None,
+            no_tools: false,
         }
     }
 
@@ -294,6 +319,49 @@ mod tests {
         let mut out = Vec::new();
         AgyEngine.parse_line(line, &mut out);
         out
+    }
+
+    #[test]
+    fn declares_image_support() {
+        assert!(AgyEngine.supports_images());
+    }
+
+    #[test]
+    fn image_attachments_inject_into_prompt_and_add_dirs() {
+        let mut request = req(Some("auto"));
+        let external_image = std::env::temp_dir().join("pasted-sandbox").join("paste-1.png");
+        let external_dir = external_image.parent().unwrap().to_string_lossy().to_string();
+        request.images = vec![
+            external_image.to_string_lossy().to_string(),
+            "relative/nested/img.jpg".into(),
+        ];
+        let args = argv(&request);
+        assert!(args.windows(2).any(|w| w == ["--add-dir", "/tmp/ws"]));
+        assert!(args.windows(2).any(|w| w == ["--add-dir", &external_dir]));
+        // Build the expected relative path the same way the engine does.
+        // On Windows, PathBuf::from("/tmp/ws").join("relative").join("nested")
+        // is not the same string as workspace.join("relative/nested/img.jpg").parent()
+        // because push keeps slashes from the joined relative path and inserts `\`.
+        let rel_image = crate::engine::images::absolutize_image_path(
+            "relative/nested/img.jpg",
+            &request.workspace,
+        )
+        .expect("relative image path should resolve");
+        let rel_nested_dir = rel_image
+            .parent()
+            .expect("resolved relative image has a parent directory");
+        assert!(
+            args.windows(2).any(|w| w == ["--add-dir", &rel_nested_dir.to_string_lossy()]),
+            "expected --add-dir for relative image parent {rel_nested_dir:?}, args={args:?}"
+        );
+
+        let prompt = args.last().unwrap();
+        assert!(prompt.contains(crate::engine::images::AGY_IMAGE_MARKER.trim()));
+        assert!(prompt.contains(&format!("<image path=\"{}\"></image>", external_image.display())));
+        assert!(
+            prompt.contains(&format!("<image path=\"{}\"></image>", rel_image.display())),
+            "prompt should reference the resolved relative image path, prompt={prompt}"
+        );
     }
 
     #[test]
@@ -351,6 +419,20 @@ mod tests {
     }
 
     #[test]
+    fn effort_skipped_for_xhigh_and_max_slugs() {
+        for slug in ["gemini-4-neon-xhigh", "gemini-4-hydrogen-xhigh", "gemini-4-neon-max"] {
+            let mut request = req(Some("auto"));
+            request.model = Some(slug.into());
+            request.effort = Some("high".into());
+            let args = argv(&request);
+            assert!(
+                !args.contains(&"--effort".to_string()),
+                "expected no redundant --effort for {slug}, args={args:?}"
+            );
+        }
+    }
+
+    #[test]
     fn parses_init_delta_tool_and_result() {
         let init = events(r#"{"event":"init","init":{"conversation_id":"abc-1"}}"#);
         match &init[..] {
@@ -394,6 +476,39 @@ mod tests {
             e,
             EngineEvent::Done { session_id: Some(id), usage: Some(_) } if id == "abc-1"
         )));
+    }
+
+    #[test]
+    fn delta_whitespace_is_stream_content_not_padding() {
+        // A chunk boundary can land on any character; the edge whitespace is
+        // markdown syntax (`## `, `\n` between table rows, code indentation),
+        // not padding. Trimming it used to glue headings/lists/tables together
+        // and break copied code (upstream #1427/#1387).
+        let delta = events(
+            "{\"event\":\"step_update\",\"step_update\":{\"step_type\":\"agent_response\",\"text_delta\":\"## \"}}",
+        );
+        match &delta[..] {
+            [EngineEvent::Delta(text)] => assert_eq!(text, "## "),
+            other => panic!("unexpected delta: {other:?}"),
+        }
+        let newline = events(
+            r#"{"event":"step_update","step_update":{"step_type":"agent_response","text_delta":"\n"}}"#,
+        );
+        match &newline[..] {
+            [EngineEvent::Delta(text)] => assert_eq!(text, "\n"),
+            other => panic!("unexpected delta: {other:?}"),
+        }
+        let indent = events(
+            r#"{"event":"step_update","step_update":{"step_type":"agent_response","text_delta":"    code"}}"#,
+        );
+        match &indent[..] {
+            [EngineEvent::Delta(text)] => assert_eq!(text, "    code"),
+            other => panic!("unexpected delta: {other:?}"),
+        }
+        let empty = events(
+            r#"{"event":"step_update","step_update":{"step_type":"agent_response","text_delta":""}}"#,
+        );
+        assert!(empty.is_empty(), "empty delta must stay dropped: {empty:?}");
     }
 
     #[test]

@@ -1,23 +1,32 @@
+import { clearSelectedBot, selectSelectedBot } from "@/features/bots/selected-bot";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { ipc, type SessionMeta } from "@/lib/ipc";
+import { ipc, type ForkPlan, type SessionMeta } from "@/lib/ipc";
 import {
   pluginBus,
   resetPluginBusForTests,
   SESSION_ACTIVATED_TOPIC,
+  SESSION_SELECTION_CHANGED_TOPIC,
 } from "@/features/plugins/runtime/events";
 import { setPluginSessionEffort, useChatStore } from "./store";
 import { OPEN_TABS_KEY } from "./store/persistence";
 import { EMPTY_SESSION } from "./store/stream";
 import { handleEngineEvents, type EngineEventDeps } from "./store/engine-events";
 import { registerSessionHooks, registerTurnHooks } from "@/features/plugins/runtime/hooks";
+import { startPluginChatRun, interruptPluginChatRun } from "@/features/plugins/runtime/session-run-bridge";
+import { usePluginHubStore } from "@/features/plugins/hub/store";
+import { usePluginTabsStore } from "@/features/plugins/runtime/center-tabs";
 import { getConversationModeState } from "@/features/plugins/conversation/state";
 
 vi.mock("@/lib/ipc", () => ({
   ipc: {
     sendMessage: vi.fn(async () => ({ runId: "run-1", sessionId: null })),
     interruptSession: vi.fn(async () => true),
+    resolveEnabledBuiltInAgent: vi.fn(),
+    closeIdleCodeBuddy: vi.fn(async () => {}),
     rememberSessionModel: vi.fn(async () => {}),
     rememberSessionEffort: vi.fn(async () => {}),
+    listWorkspaces: vi.fn(async () => []),
+    listEngines: vi.fn(async () => []),
     listSessions: vi.fn(async () => []),
     listArchivedSessions: vi.fn(async () => []),
     listPlanReviews: vi.fn(async () => []),
@@ -27,9 +36,19 @@ vi.mock("@/lib/ipc", () => ({
     loadRemoteSessionPage: vi.fn(async () => ({ messages: [], nextBefore: null, subagentHistory: [] })),
     deleteSession: vi.fn(async () => {}),
     deleteRemoteSession: vi.fn(async () => {}),
+    // 回显被要求分叉的那个会话（真后端就是这样返回的）。
+    forkSession: vi.fn(async (_engine: string, sessionId: string) => ({
+      sourceSessionId: sessionId,
+      sourceEngine: "claude",
+      targetSessionId: "target-session",
+      atTip: false,
+      keepRecords: 6,
+      sourceTitle: "甲会话",
+    })),
     getAppSettings: vi.fn(async () => ({})),
     updateAppSettings: vi.fn(async () => {}),
     rescanSessions: vi.fn(async () => {}),
+    getCliConfig: vi.fn(async () => null),
   },
 }));
 vi.mock("@/lib/events", () => ({
@@ -48,15 +67,20 @@ function resetStore() {
   vi.mocked(ipc.archiveSession).mockClear();
   vi.mocked(ipc.listArchivedSessions).mockResolvedValue([]);
   useChatStore.setState({
+    initialized: false,
     openTabs: [],
     active: null,
     activeEngine: "claude",
+    workspaceDefaultEngines: {},
+    unavailableNewChat: null,
     models: { omp: "kimi-k3" },
+    providers: {},
     efforts: {},
     archivedSessionKeys: {},
     bySession: {},
     streamingByKey: {},
     retryingByKey: {},
+    forkingByKey: {},
     unseen: {},
     drafts: {},
     restoredSessionKeys: {},
@@ -163,7 +187,12 @@ describe("per-session composer selection", () => {
       useChatStore.getState().startNewChat(WS);
 
       useChatStore.getState().setActiveEngine("claude");
-      expect(seen.at(-1)).toEqual({ engine: "claude", sessionId: null });
+      expect(seen.at(-1)).toEqual({
+        engine: "claude",
+        sessionId: null,
+        provider: null,
+        model: null,
+      });
 
       // 已经是该引擎：不重复广播（避免插件被无意义的重复事件打扰）
       const afterRetarget = seen.length;
@@ -203,6 +232,21 @@ describe("per-session composer selection", () => {
       modes.exit(identity);
       dispose();
     }
+  });
+});
+
+describe("closing a CodeBuddy tab", () => {
+  it("releases only the closed session's CLI process", () => {
+    resetStore();
+    const closing = { engine: "codebuddy", sessionId: "closing", workspacePath: WS };
+    const remaining = { engine: "codebuddy", sessionId: "remaining", workspacePath: WS };
+    useChatStore.setState({ active: remaining, openTabs: [closing, remaining] });
+
+    useChatStore.getState().closeTab(closing.engine, closing.sessionId, WS);
+
+    expect(ipc.closeIdleCodeBuddy).toHaveBeenCalledExactlyOnceWith("closing");
+    expect(ipc.interruptSession).not.toHaveBeenCalled();
+    expect(useChatStore.getState().openTabs).toEqual([remaining]);
   });
 });
 
@@ -906,5 +950,1058 @@ describe("setPluginSessionEffort (ctx.sessions.setEffort backend)", () => {
     expect(() => setPluginSessionEffort("", "s-effort", WS, "high")).toThrow(
       "required",
     );
+  });
+});
+
+describe("reloadSession renders the edited native history", () => {
+  const target: SessionMeta = {
+    engine: "omp", sessionId: "edited", workspacePath: WS,
+    filePath: "/home/me/.omp/agent/sessions/ws/timestamp_edited.jsonl",
+    fileSize: 10, fileMtimeMs: 1, title: "Edited session", preview: "",
+    createdAt: 1, updatedAt: 1, messageCount: 2, pinned: false, customTitle: null,
+  };
+  const key = "omp/edited";
+  const row = (seq: number, text: string) => ({ seq, role: "assistant", text, ts: null });
+
+  beforeEach(() => {
+    resetStore();
+    vi.mocked(ipc.loadSessionPage).mockReset();
+    vi.mocked(ipc.listPlanReviews).mockResolvedValue([]);
+    useChatStore.setState({ sessions: [target], actionError: null });
+  });
+
+  it("replaces edited and deleted rows across all already-visible pages without disturbing another session", async () => {
+    const otherTab = { engine: "codex", sessionId: "other", workspacePath: WS };
+    const other = { ...EMPTY_SESSION, messages: [row(1, "Other conversation")] };
+    const oldMessages = Array.from({ length: 650 }, (_, index) => row(index + 1, "Stale reply"));
+    const queue = [{ id: "q", text: "Keep queued input", images: [], queuedAt: 1 }];
+    useChatStore.setState({
+      active: otherTab, openTabs: [otherTab], drafts: { [key]: "Keep my draft" },
+      bySession: {
+        [key]: { ...EMPTY_SESSION, messages: oldMessages, nextBefore: 1, activeModel: "provider/model", activeEffort: "high", activeProvider: "channel", queue },
+        "codex/other": other,
+      },
+    });
+    const native = Array.from({ length: 720 }, (_, index) => row(index + 1, `Edited reply ${index + 1}`));
+    vi.mocked(ipc.loadSessionPage).mockImplementation(async (_engine, _id, limit = 100, before) => {
+      const end = before == null ? native.length : native.findIndex((message) => message.seq >= before);
+      const start = Math.max(0, end - limit);
+      return { messages: native.slice(start, end), nextBefore: start > 0 ? native[start].seq : null, subagentHistory: [] };
+    });
+
+    await useChatStore.getState().reloadSession(target);
+
+    const state = useChatStore.getState();
+    expect(state.bySession[key].messages.map((message) => message.text)).toEqual(native.slice(70).map((message) => message.text));
+    expect(state.bySession[key].nextBefore).toBe(71);
+    expect(state.bySession[key]).toMatchObject({ loading: false, activeModel: "provider/model", activeEffort: "high", activeProvider: "channel" });
+    expect(state.bySession[key].queue).toBe(queue);
+    expect(state.bySession["codex/other"]).toBe(other);
+    expect(state.active).toBe(otherTab);
+    expect(state.openTabs).toEqual([otherTab]);
+    expect(state.drafts[key]).toBe("Keep my draft");
+  });
+
+  it("keeps the previous render intact while loading and after a read failure", async () => {
+    const messages = [row(1, "Existing answer")];
+    const usage = { input_tokens: 42 };
+    const pending = Promise.withResolvers<any>();
+    useChatStore.setState({ bySession: { [key]: { ...EMPTY_SESSION, messages, usage } } });
+    vi.mocked(ipc.loadSessionPage).mockReturnValueOnce(pending.promise);
+    const refresh = useChatStore.getState().reloadSession(target);
+    expect(useChatStore.getState().bySession[key].messages).toBe(messages);
+    expect(useChatStore.getState().bySession[key].loading).toBe(true);
+    pending.reject(new Error("Transcript was removed"));
+    await refresh;
+    expect(useChatStore.getState().bySession[key].messages).toBe(messages);
+    expect(useChatStore.getState().bySession[key].usage).toBe(usage);
+    expect(useChatStore.getState().bySession[key].loading).toBe(false);
+    expect(useChatStore.getState().actionError).toContain("Transcript was removed");
+  });
+
+  it("does not replace a live turn that starts while the file is being read", async () => {
+    const pending = Promise.withResolvers<any>();
+    useChatStore.setState({ bySession: { [key]: { ...EMPTY_SESSION, messages: [row(1, "Before refresh")] } } });
+    vi.mocked(ipc.loadSessionPage).mockReturnValueOnce(pending.promise);
+    const refresh = useChatStore.getState().reloadSession(target);
+    const current = useChatStore.getState().bySession[key];
+    const live = [row(1, "Before refresh"), { ...row(2, "New live answer"), live: true }];
+    useChatStore.setState({ bySession: { [key]: { ...current, messages: live, streaming: true } }, streamingByKey: { [key]: true } });
+    pending.resolve({ messages: [row(1, "Old disk snapshot")], nextBefore: null, subagentHistory: [] });
+    await refresh;
+    expect(useChatStore.getState().bySession[key].messages).toBe(live);
+    expect(useChatStore.getState().bySession[key].streaming).toBe(true);
+    expect(useChatStore.getState().bySession[key].loading).toBe(false);
+  });
+
+  it("does not resurrect a session removed while refresh is in flight", async () => {
+    const pending = Promise.withResolvers<any>();
+    useChatStore.setState({ bySession: { [key]: { ...EMPTY_SESSION, messages: [row(1, "Before deletion")] } } });
+    vi.mocked(ipc.loadSessionPage).mockReturnValueOnce(pending.promise);
+    const refresh = useChatStore.getState().reloadSession(target);
+    useChatStore.setState({ bySession: {}, sessions: [] });
+    pending.resolve({ messages: [row(1, "Deleted transcript")], nextBefore: null, subagentHistory: [] });
+    await refresh;
+    expect(useChatStore.getState().bySession[key]).toBeUndefined();
+    expect(useChatStore.getState().sessions).toEqual([]);
+  });
+
+  it("an empty edited transcript clears the old messages and token usage", async () => {
+    useChatStore.setState({ bySession: { [key]: { ...EMPTY_SESSION, messages: [row(1, "Removed answer")], usage: { input_tokens: 42 }, turnUsage: { output_tokens: 8 } } } });
+    vi.mocked(ipc.loadSessionPage).mockResolvedValueOnce({ messages: [], nextBefore: null, subagentHistory: [] });
+    await useChatStore.getState().reloadSession(target);
+    expect(useChatStore.getState().bySession[key]).toMatchObject({ messages: [], usage: null, turnUsage: null, nextBefore: null, loading: false });
+  });
+});
+
+describe("session://activated emissions", () => {
+  beforeEach(resetStore);
+
+  function watch() {
+    const seen: unknown[] = [];
+    const dispose = pluginBus.on(SESSION_ACTIVATED_TOPIC, (data) => seen.push(data));
+    return { seen, dispose };
+  }
+
+  /** What a plugin that finishes loading right now would replay. */
+  function retained() {
+    const replay: unknown[] = [];
+    pluginBus.on(SESSION_ACTIVATED_TOPIC, (data) => replay.push(data))();
+    return replay;
+  }
+
+  it("startNewChat announces the switch, but not a re-focus of the same pending tab", () => {
+    const { seen, dispose } = watch();
+    try {
+      const existing = { engine: "claude", sessionId: "s-1", workspacePath: WS };
+      useChatStore.setState({
+        activeEngine: "claude",
+        active: existing,
+        openTabs: [existing],
+      });
+
+      useChatStore.getState().startNewChat(WS);
+      expect(seen.at(-1)).toEqual({
+        engine: "claude",
+        sessionId: null,
+        provider: null,
+        model: null,
+      });
+
+      // Re-focusing the existing pending tab is not a switch: no event.
+      const count = seen.length;
+      useChatStore.getState().startNewChat(WS);
+      expect(seen.length).toBe(count);
+    } finally {
+      dispose();
+    }
+  });
+
+  it("keeps the retained activation current when the send response brings the native id", async () => {
+    const { seen, dispose } = watch();
+    try {
+      useChatStore.setState({ activeEngine: "omp", sessions: [] });
+      useChatStore.getState().startNewChat(WS);
+      vi.mocked(ipc.sendMessage).mockResolvedValueOnce({
+        runId: "run-adopt",
+        sessionId: "s-9",
+      });
+
+      await useChatStore.getState().send("hi", []);
+      expect(useChatStore.getState().active?.sessionId).toBe("s-9");
+      // The adoption re-emits the activation with the native id...
+      expect(seen.at(-1)).toEqual({
+        engine: "omp",
+        sessionId: "s-9",
+        provider: null,
+        model: "kimi-k3",
+      });
+
+      // ...so a later model change can repair the retained snapshot.
+      await useChatStore.getState().setModel("omp", "fufei/kimi-k3");
+      expect(retained()).toEqual([
+        {
+          engine: "omp",
+          sessionId: "s-9",
+          provider: null,
+          model: "fufei/kimi-k3",
+        },
+      ]);
+    } finally {
+      dispose();
+    }
+  });
+
+  it("keeps the retained activation current when a session event names the native id", async () => {
+    const { seen, dispose } = watch();
+    try {
+      useChatStore.setState({ activeEngine: "omp", sessions: [] });
+      useChatStore.getState().startNewChat(WS);
+      vi.mocked(ipc.sendMessage).mockResolvedValueOnce({
+        runId: "run-named",
+        sessionId: null,
+      });
+      await useChatStore.getState().send("hi", []);
+
+      handleEngineEvents(
+        [
+          {
+            runId: "run-named",
+            sessionId: null,
+            engine: "omp",
+            seq: 1,
+            kind: "session",
+            data: "s-9",
+          },
+        ],
+        engineDeps(),
+      );
+
+      expect(useChatStore.getState().active?.sessionId).toBe("s-9");
+      expect(seen.at(-1)).toEqual({
+        engine: "omp",
+        sessionId: "s-9",
+        provider: null,
+        model: "kimi-k3",
+      });
+
+      await useChatStore.getState().setModel("omp", "fufei/kimi-k3");
+      expect(retained()).toEqual([
+        {
+          engine: "omp",
+          sessionId: "s-9",
+          provider: null,
+          model: "fufei/kimi-k3",
+        },
+      ]);
+    } finally {
+      dispose();
+    }
+  });
+
+  it("publishes the hydrated default model on the startup activation", async () => {
+    const tab = { engine: "claude", sessionId: null, workspacePath: WS };
+    localStorage.setItem(OPEN_TABS_KEY, JSON.stringify([tab]));
+    localStorage.setItem("ccgui-next.activeSession:v1", JSON.stringify(tab));
+    vi.mocked(ipc.listWorkspaces).mockResolvedValueOnce([
+      {
+        id: "w-1",
+        path: WS,
+        name: "ws",
+        lastOpenedAt: null,
+        sortOrder: null,
+        groupId: null,
+      },
+    ]);
+    vi.mocked(ipc.getAppSettings).mockResolvedValueOnce({
+      defaultModels: { claude: "claude-default-x" },
+    } as never);
+
+    await useChatStore.getState().init();
+
+    // The activation was emitted AFTER settings hydration, so a plugin
+    // loading late replays the default model instead of null.
+    expect(retained()).toEqual([
+      {
+        engine: "claude",
+        sessionId: null,
+        provider: null,
+        model: "claude-default-x",
+      },
+    ]);
+  });
+});
+
+describe("session://selection-changed emissions", () => {
+  beforeEach(resetStore);
+
+  function watch(topic: string) {
+    const seen: unknown[] = [];
+    const dispose = pluginBus.on(topic, (data) => seen.push(data));
+    return { seen, dispose };
+  }
+
+  function retained() {
+    const replay: unknown[] = [];
+    pluginBus.on(SESSION_ACTIVATED_TOPIC, (data) => replay.push(data))();
+    return replay;
+  }
+
+  it("announces the adoption once when the session event beats the send response", async () => {
+    useChatStore.setState({ activeEngine: "omp", sessions: [] });
+    useChatStore.getState().startNewChat(WS);
+    const activated = watch(SESSION_ACTIVATED_TOPIC);
+    const changed = watch(SESSION_SELECTION_CHANGED_TOPIC);
+    try {
+      vi.mocked(ipc.sendMessage).mockImplementationOnce(async () => {
+        handleEngineEvents(
+          [
+            {
+              runId: "run-race",
+              sessionId: null,
+              engine: "omp",
+              seq: 1,
+              kind: "session",
+              data: "s-7",
+            },
+          ],
+          engineDeps(),
+        );
+        return { runId: "run-race", sessionId: "s-7" };
+      });
+
+      await useChatStore.getState().send("hi", []);
+
+      expect(useChatStore.getState().active?.sessionId).toBe("s-7");
+      expect(
+        activated.seen.filter(
+          (p) => (p as { sessionId: unknown }).sessionId === "s-7",
+        ),
+      ).toEqual([
+        { engine: "omp", sessionId: "s-7", provider: null, model: "kimi-k3" },
+      ]);
+      // Adopting the native id is an activation, not a selection change.
+      expect(changed.seen).toEqual([]);
+    } finally {
+      activated.dispose();
+      changed.dispose();
+    }
+  });
+
+  it("does not read the adoption's half-applied tab strip as a model change", async () => {
+    useChatStore.setState({ activeEngine: "omp", sessions: [] });
+    useChatStore.getState().startNewChat(WS);
+    await useChatStore.getState().setModel("omp", "fufei/kimi-k3");
+    vi.mocked(ipc.sendMessage).mockResolvedValueOnce({
+      runId: "run-reported",
+      sessionId: null,
+    });
+    await useChatStore.getState().send("hi", []);
+    const activated = watch(SESSION_ACTIVATED_TOPIC);
+    const changed = watch(SESSION_SELECTION_CHANGED_TOPIC);
+    try {
+      // The engine names the concrete model before the session id: the
+      // tab's pick still wins on the composer, so nothing changed for plugins.
+      handleEngineEvents(
+        [
+          { runId: "run-reported", sessionId: null, engine: "omp", seq: 1, kind: "model", data: "glm-5" },
+          { runId: "run-reported", sessionId: null, engine: "omp", seq: 2, kind: "session", data: "s-9" },
+        ],
+        engineDeps(),
+      );
+
+      expect(useChatStore.getState().active?.sessionId).toBe("s-9");
+      expect(changed.seen).toEqual([]);
+      expect(activated.seen.at(-1)).toEqual({
+        engine: "omp",
+        sessionId: "s-9",
+        provider: null,
+        model: "fufei/kimi-k3",
+      });
+    } finally {
+      activated.dispose();
+      changed.dispose();
+    }
+  });
+
+  it("follows a default-channel edit made outside the picker (Settings)", async () => {
+    useChatStore.setState({ activeEngine: "omp", providers: { omp: "chan-a" } });
+    useChatStore.getState().startNewChat(WS);
+    const changed = watch(SESSION_SELECTION_CHANGED_TOPIC);
+    try {
+      vi.mocked(ipc.getCliConfig).mockResolvedValueOnce({
+        omp: { current: "chan-b", providers: [] },
+      } as never);
+
+      await useChatStore.getState().refreshEngines();
+
+      expect(changed.seen).toEqual([
+        { engine: "omp", sessionId: null, provider: "chan-b", model: "kimi-k3" },
+      ]);
+      expect(retained()).toEqual([
+        { engine: "omp", sessionId: null, provider: "chan-b", model: "kimi-k3" },
+      ]);
+    } finally {
+      changed.dispose();
+    }
+  });
+
+  it("publishes the model the loaded history reveals", async () => {
+    useChatStore.setState({
+      activeEngine: "omp",
+      sessions: [
+        {
+          engine: "omp",
+          sessionId: "s-old",
+          workspacePath: WS,
+          title: "old",
+          updatedAt: 0,
+        } as SessionMeta,
+      ],
+    });
+    vi.mocked(ipc.loadSessionPage).mockResolvedValueOnce({
+      messages: [
+        { role: "user", text: "q", ts: "2026-01-01T00:00:00Z" },
+        {
+          role: "assistant",
+          text: "a",
+          ts: "2026-01-01T00:00:01Z",
+          model: "glm-5",
+        },
+      ],
+      nextBefore: null,
+      subagentHistory: [],
+    } as never);
+    const changed = watch(SESSION_SELECTION_CHANGED_TOPIC);
+    try {
+      await useChatStore.getState().selectSession("omp", "s-old", WS);
+
+      expect(changed.seen).toEqual([
+        { engine: "omp", sessionId: "s-old", provider: null, model: "glm-5" },
+      ]);
+      expect(retained()).toEqual([
+        { engine: "omp", sessionId: "s-old", provider: null, model: "glm-5" },
+      ]);
+    } finally {
+      changed.dispose();
+    }
+  });
+
+  it("emits a picker change exactly once", async () => {
+    const tab = { engine: "omp", sessionId: "s-1", workspacePath: WS };
+    useChatStore.setState({ activeEngine: "omp", active: tab, openTabs: [tab] });
+    const changed = watch(SESSION_SELECTION_CHANGED_TOPIC);
+    try {
+      await useChatStore.getState().setModel("omp", "fufei/kimi-k3");
+
+      expect(changed.seen).toEqual([
+        {
+          engine: "omp",
+          sessionId: "s-1",
+          provider: null,
+          model: "fufei/kimi-k3",
+        },
+      ]);
+    } finally {
+      changed.dispose();
+    }
+  });
+
+  it("leaves tab switches to session://activated", async () => {
+    const a = { engine: "omp", sessionId: "s-1", workspacePath: WS, model: "m-a" };
+    const b = { engine: "omp", sessionId: "s-2", workspacePath: WS, model: "m-b" };
+    useChatStore.setState({ activeEngine: "omp", active: a, openTabs: [a, b] });
+    const changed = watch(SESSION_SELECTION_CHANGED_TOPIC);
+    try {
+      useChatStore.getState().focusTab("omp", "s-2", WS);
+      useChatStore.getState().startNewChat(WS);
+
+      expect(changed.seen).toEqual([]);
+    } finally {
+      changed.dispose();
+    }
+  });
+});
+
+/** 会话分叉的点击入口（真机反馈：点分支后当前窗口变空白）。
+ *
+ *  分叉是**点击即落盘**的（后端在 `fork_session` 里就写好继承过来的前缀转录本
+ *  并登记 `sessions` 行），所以分支页签从出现的第一刻起就有历史可读。这里盯的
+ *  是**页签**：如果 `openTabs` 里没有它，页签条上就看不到这条分支，用户无法切回
+ *  原会话，观感就是"当前窗口被清空了"。 */
+describe("forkSession", () => {
+  const SRC = "11111111-2222-4333-8444-555555555555";
+
+  it("appends a new tab and activates it, keeping the source tab", async () => {
+    useChatStore.setState({
+      openTabs: [{ engine: "claude", sessionId: SRC, workspacePath: WS }],
+      active: { engine: "claude", sessionId: SRC, workspacePath: WS },
+      activeEngine: "claude",
+      // 分支标题的来源：会话目录里的这条（`customTitle` 优先）。
+      sessions: [
+        {
+          engine: "claude",
+          sessionId: SRC,
+          workspacePath: WS,
+          title: "甲会话",
+        } as never,
+      ],
+      bySession: {},
+    });
+
+    await useChatStore.getState().forkSession("claude", SRC, WS);
+
+    const s = useChatStore.getState();
+    // 原会话仍在（不能被替换掉，否则用户回不去）。
+    expect(s.openTabs.some((t) => t.sessionId === SRC)).toBe(true);
+    // 新分支页签真的加进来了，并且是当前激活项。
+    expect(s.openTabs).toHaveLength(2);
+    const forkTab = s.openTabs.find((t) => t.sessionId === "target-session");
+    expect(forkTab).toBeDefined();
+    expect(s.active?.sessionId).toBe("target-session");
+    // 标题由后端生成（`<来源标题> (fork #N)`），前端不再传标题，也无需自己查重。
+    expect(ipc.forkSession).toHaveBeenCalledWith("claude", SRC, null);
+    expect(s.actionError).toBeFalsy();
+  });
+
+  it("opens the branch in the workspace the backend reports, not blindly the source's", async () => {
+    // 后端可能把分支落在**另一个**工作区（Claude 按"源转录本所在目录"找文件）。
+    // 这个字段一旦被前端忽略，页签会指向源会话的工作区，而转录本在别处——用户看到
+    // 的分支就是空的历史。默认 mock 不返回 `workspacePath`，所以只覆盖了回退分支；
+    // 这里显式覆盖"后端给了不同工作区"的那条路。
+    vi.mocked(ipc.forkSession).mockResolvedValueOnce({
+      sourceSessionId: SRC,
+      sourceEngine: "claude",
+      targetSessionId: "target-elsewhere",
+      workspacePath: "D:/some/other/workspace",
+      atTip: false,
+      keepRecords: 6,
+      sourceTitle: "甲会话",
+    });
+    useChatStore.setState({
+      openTabs: [{ engine: "claude", sessionId: SRC, workspacePath: WS }],
+      active: { engine: "claude", sessionId: SRC, workspacePath: WS },
+      activeEngine: "claude",
+      sessions: [
+        { engine: "claude", sessionId: SRC, workspacePath: WS, title: "甲会话" } as never,
+      ],
+      bySession: {},
+    });
+
+    await useChatStore.getState().forkSession("claude", SRC, WS);
+
+    const s = useChatStore.getState();
+    const forkTab = s.openTabs.find((t) => t.sessionId === "target-elsewhere");
+    expect(forkTab?.workspacePath).toBe("D:/some/other/workspace");
+    expect(s.active?.workspacePath).toBe("D:/some/other/workspace");
+  });
+
+  it("reports a fork failure with the fork-specific message", async () => {
+    vi.mocked(ipc.forkSession).mockRejectedValueOnce(new Error("boom"));
+    useChatStore.setState({
+      openTabs: [{ engine: "claude", sessionId: SRC, workspacePath: WS }],
+      active: { engine: "claude", sessionId: SRC, workspacePath: WS },
+      actionError: null,
+    });
+
+    await useChatStore.getState().forkSession("claude", SRC, WS);
+
+    const s = useChatStore.getState();
+    // 失败要说清是"创建分支"失败，而不是丢一句原始错误。
+    expect(s.actionError).toContain("boom");
+    expect(s.actionError).not.toBe("boom");
+    // 失败不动原会话、不加页签。
+    expect(s.openTabs).toHaveLength(1);
+    expect(s.active?.sessionId).toBe(SRC);
+  });
+
+  it("does not report a fork failure when only reading the branch history fails", async () => {
+    // 分叉本身已经成功（分支文件 + sessions 行都落地了），只有后续"把历史读进
+    // 时间线"失败。这时报「创建分支失败」会让用户以为白点了一次，而分支其实
+    // 已经存在、页签也开好了。
+    useChatStore.setState({
+      openTabs: [{ engine: "claude", sessionId: SRC, workspacePath: WS }],
+      active: { engine: "claude", sessionId: SRC, workspacePath: WS },
+      actionError: null,
+      bySession: {},
+      forkingByKey: {},
+    });
+    const selectSpy = vi
+      .spyOn(useChatStore.getState(), "selectSession")
+      .mockRejectedValueOnce(new Error("read failed"));
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    await useChatStore.getState().forkSession("claude", SRC, WS);
+
+    const s = useChatStore.getState();
+    expect(s.actionError).toBeFalsy();
+    // 分支页签已经在了 —— 证明分叉确实成功。
+    expect(s.openTabs.some((t) => t.sessionId === "target-session")).toBe(true);
+    // 防重入标记也要清掉，否则入口永远停在"进行中"。
+    expect(s.forkingByKey[`claude/${SRC}`]).toBeUndefined();
+    selectSpy.mockRestore();
+    errorSpy.mockRestore();
+  });
+
+  it("ignores a second fork of the same session while the first is in flight", async () => {
+    vi.mocked(ipc.forkSession).mockClear();
+    let releaseFork!: (plan: ForkPlan) => void;
+    vi.mocked(ipc.forkSession).mockImplementationOnce(
+      () =>
+        new Promise<ForkPlan>((resolve) => {
+          releaseFork = resolve;
+        }),
+    );
+    useChatStore.setState({
+      openTabs: [{ engine: "claude", sessionId: SRC, workspacePath: WS }],
+      active: { engine: "claude", sessionId: SRC, workspacePath: WS },
+      bySession: {},
+      forkingByKey: {},
+    });
+
+    const first = useChatStore.getState().forkSession("claude", SRC, WS);
+    const second = useChatStore.getState().forkSession("claude", SRC, WS);
+
+    // 防重入：双击不该建出两个分支（后端各自分配标题编号，用户拿到两条看起来
+    // 一样的会话）。第二次点击直接丢弃。
+    expect(ipc.forkSession).toHaveBeenCalledTimes(1);
+    // 在飞期间入口显示"进行中"（按钮据此置灰）。
+    expect(useChatStore.getState().forkingByKey[`claude/${SRC}`]).toBe(true);
+
+    releaseFork({
+      sourceSessionId: SRC,
+      sourceEngine: "claude",
+      targetSessionId: "target-session",
+      atTip: true,
+      sourceTitle: "甲会话",
+    });
+    await Promise.all([first, second]);
+
+    expect(useChatStore.getState().forkingByKey[`claude/${SRC}`]).toBeUndefined();
+    expect(useChatStore.getState().openTabs).toHaveLength(2);
+  });
+
+  it("clears the in-flight mark when the fork fails", async () => {
+    vi.mocked(ipc.forkSession).mockClear();
+    vi.mocked(ipc.forkSession).mockRejectedValueOnce(new Error("boom"));
+    useChatStore.setState({
+      openTabs: [{ engine: "claude", sessionId: SRC, workspacePath: WS }],
+      active: { engine: "claude", sessionId: SRC, workspacePath: WS },
+      forkingByKey: {},
+    });
+
+    await useChatStore.getState().forkSession("claude", SRC, WS);
+
+    // 失败也要解锁，否则入口会永远停在"进行中"。
+    expect(useChatStore.getState().forkingByKey[`claude/${SRC}`]).toBeUndefined();
+  });
+
+  it("announces the new session to plugins exactly once", async () => {
+    // 该主题是**保留**主题：晚订阅者会先收到上一次的值（回声），先清干净再订阅，
+    // 否则数到的是上一条测试留下的那一次。
+    resetPluginBusForTests();
+    const seen: { engine: string | null; sessionId: string | null }[] = [];
+    const dispose = pluginBus.on(SESSION_ACTIVATED_TOPIC, (data) =>
+      seen.push(data as { engine: string | null; sessionId: string | null }),
+    );
+    try {
+      useChatStore.setState({
+        openTabs: [{ engine: "claude", sessionId: SRC, workspacePath: WS }],
+        active: { engine: "claude", sessionId: SRC, workspacePath: WS },
+        forkingByKey: {},
+      });
+
+      await useChatStore.getState().forkSession("claude", SRC, WS);
+
+      // selectSession 每次都广播；forkSession 里再补发一次就是同一件事说两遍。
+      expect(seen.filter((event) => event.sessionId === "target-session")).toHaveLength(1);
+    } finally {
+      dispose();
+      resetPluginBusForTests();
+    }
+  });
+});
+
+describe("插件续接原生会话", () => {
+  const target: SessionMeta = {
+    engine: "claude", sessionId: "plugin-resume", workspacePath: WS,
+    filePath: "/tmp/plugin-resume.jsonl", fileSize: 10, fileMtimeMs: 1,
+    title: "续接会话", preview: "", createdAt: 1, updatedAt: 1,
+    messageCount: 0, pinned: false, customTitle: null,
+  };
+  const key = "claude/plugin-resume";
+  const def = { engine: target.engine, sessionId: target.sessionId, workspacePath: WS, prompt: "继续任务" };
+
+  beforeEach(() => {
+    resetStore();
+    usePluginHubStore.getState().close();
+    usePluginTabsStore.setState({ tabs: [], activeId: null });
+    vi.mocked(ipc.loadSessionPage).mockReset();
+    vi.mocked(ipc.loadSessionPage).mockResolvedValue({ messages: [], nextBefore: null, subagentHistory: [] });
+    vi.mocked(ipc.listPlanReviews).mockResolvedValue([]);
+    vi.mocked(ipc.sendMessage).mockResolvedValue({ runId: "resume-integration", sessionId: target.sessionId });
+    useChatStore.setState({ sessions: [target] });
+  });
+
+  it.each(["插件中心", "插件页签"])("从%s续接时显示聊天并保留历史", async (surface) => {
+    if (surface === "插件中心") usePluginHubStore.getState().openHub();
+    else usePluginTabsStore.getState().openTab("plugin:board");
+    vi.mocked(ipc.loadSessionPage).mockResolvedValue({
+      messages: [{ seq: 1, role: "assistant", text: "已有回复", ts: null }], nextBefore: null, subagentHistory: [],
+    });
+
+    await startPluginChatRun("board", def);
+
+    expect(usePluginHubStore.getState().active).toBe(false);
+    expect(usePluginTabsStore.getState().activeId).toBeNull();
+    expect(useChatStore.getState().active).toMatchObject({ engine: def.engine, sessionId: def.sessionId, workspacePath: WS });
+    expect(useChatStore.getState().bySession[key].messages.map((message) => message.text)).toEqual(["已有回复", def.prompt]);
+    expect(ipc.sendMessage).toHaveBeenCalledWith(expect.objectContaining({ sessionId: target.sessionId }));
+    await interruptPluginChatRun("board", def);
+  });
+
+  it("历史读取失败后可重试，成功加载空历史会清除旧错误", async () => {
+    vi.mocked(ipc.loadSessionPage).mockRejectedValueOnce(new Error("读取失败"));
+    await expect(startPluginChatRun("board", def)).rejects.toThrow("session_load_failed");
+    expect(ipc.sendMessage).not.toHaveBeenCalled();
+    expect(useChatStore.getState().bySession[key].error).toContain("读取失败");
+
+    await expect(startPluginChatRun("board", def)).resolves.toMatchObject({ sessionId: target.sessionId });
+    expect(useChatStore.getState().bySession[key].error).toBeNull();
+    expect(ipc.sendMessage).toHaveBeenCalledTimes(1);
+    await interruptPluginChatRun("board", def);
+  });
+
+  it("续接沿用用户在该会话中切换的模型", async () => {
+    vi.mocked(ipc.loadSessionPage).mockResolvedValue({
+      messages: [{ seq: 1, role: "assistant", text: "已有回复", ts: null, model: "old-model" }],
+      nextBefore: null,
+      subagentHistory: [],
+    });
+    await useChatStore.getState().selectSession(target.engine, target.sessionId, WS);
+    await useChatStore.getState().setModel(target.engine, "picked-model");
+
+    await startPluginChatRun("board", { ...def, model: "plugin-override" });
+
+    expect(ipc.sendMessage).toHaveBeenCalledWith(expect.objectContaining({ model: "picked-model" }));
+    await interruptPluginChatRun("board", def);
+  });
+
+  it("引擎回执未返回会话 ID 时仍保留续接身份与停止权限", async () => {
+    vi.mocked(ipc.sendMessage).mockResolvedValueOnce({ runId: "resume-no-id", sessionId: null });
+    await expect(startPluginChatRun("board", def)).resolves.toEqual({ runId: "resume-no-id", sessionId: target.sessionId });
+    await interruptPluginChatRun("board", def);
+    expect(ipc.interruptSession).toHaveBeenCalledWith(target.sessionId);
+  });
+
+  it("已有历史加载尚未完成时拒绝发送，不提前追加消息", async () => {
+    const pending = Promise.withResolvers<Awaited<ReturnType<typeof ipc.loadSessionPage>>>();
+    vi.mocked(ipc.loadSessionPage).mockReturnValueOnce(pending.promise);
+    const loading = useChatStore.getState().selectSession(target.engine, target.sessionId, WS);
+    await expect(startPluginChatRun("board", def)).rejects.toThrow("session_busy");
+    expect(ipc.sendMessage).not.toHaveBeenCalled();
+    pending.resolve({ messages: [], nextBefore: null, subagentHistory: [] });
+    await loading;
+  });
+
+  it("不传 sessionId 停止时只停插件自己的续接轮次，不碰用户的新聊天", async () => {
+    const pendingKey = `new:${target.engine}:${WS}`;
+    vi.mocked(ipc.sendMessage).mockResolvedValueOnce({ runId: "user-new-chat", sessionId: null });
+    useChatStore.getState().startNewChat(WS);
+    await useChatStore.getState().send("用户自己的新聊天", []);
+    expect(useChatStore.getState().streamingByKey[pendingKey]).toBe(true);
+
+    vi.mocked(ipc.sendMessage).mockResolvedValueOnce({ runId: "plugin-resume-run", sessionId: target.sessionId });
+    await startPluginChatRun("stop-probe", def);
+    vi.mocked(ipc.interruptSession).mockClear();
+
+    await interruptPluginChatRun("stop-probe", { engine: def.engine, workspacePath: WS });
+
+    expect(ipc.interruptSession).not.toHaveBeenCalledWith("user-new-chat");
+    expect(useChatStore.getState().streamingByKey[pendingKey]).toBe(true);
+    expect(ipc.interruptSession).toHaveBeenCalledWith(target.sessionId);
+    expect(useChatStore.getState().streamingByKey[key]).toBeFalsy();
+  });
+
+  it("续接时模型、渠道和推理强度都沿用会话自己的，忽略本轮覆盖", async () => {
+    useChatStore.setState({
+      sessions: [{ ...target, model: "session-model", provider: "session-channel", effort: "low" }],
+    });
+    vi.mocked(ipc.rememberSessionModel).mockClear();
+
+    await startPluginChatRun("override-probe", {
+      ...def, model: "plugin-model", providerId: "plugin-channel", effort: "high",
+    });
+
+    expect(ipc.sendMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ model: "session-model", providerId: "session-channel", effort: "low" }),
+    );
+    expect(ipc.rememberSessionModel).not.toHaveBeenCalledWith(target.engine, target.sessionId, "plugin-model");
+  });
+
+  it("不传 sessionId 连续新建时，第二轮不因第一轮尚未拿到原生 id 被拒绝", async () => {
+    vi.mocked(ipc.sendMessage)
+      .mockResolvedValueOnce({ runId: "new-a", sessionId: null })
+      .mockResolvedValueOnce({ runId: "new-b", sessionId: null });
+    const newRun = { engine: def.engine, workspacePath: WS, prompt: "新任务" };
+
+    await startPluginChatRun("new-run-probe", newRun);
+    await expect(startPluginChatRun("new-run-probe", newRun)).resolves.toMatchObject({ runId: "new-b" });
+    expect(ipc.sendMessage).toHaveBeenCalledTimes(2);
+  });
+
+  it("send 层的忙碌检查对续接仍然生效", async () => {
+    useChatStore.setState({ streamingByKey: { [key]: true } });
+    await expect(
+      useChatStore.getState().send("继续", [], { onStarted: () => {} }, {
+        engine: target.engine, sessionId: target.sessionId, workspacePath: WS,
+      }),
+    ).rejects.toThrow("session_busy");
+    expect(ipc.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it.each([true, false])("待发键共享时只停止插件轮次（终态早于回执：%s）", async (early) => {
+    const pendingKey = `new:${target.engine}:${WS}`;
+    vi.mocked(ipc.sendMessage)
+      .mockResolvedValueOnce({ runId: "user-pending-run", sessionId: null })
+      .mockResolvedValueOnce({ runId: "plugin-pending-run", sessionId: null });
+    useChatStore.getState().startNewChat(WS);
+    await useChatStore.getState().send("用户的新聊天", []);
+    const scope = { engine: target.engine, workspacePath: WS };
+    await startPluginChatRun("pending-owner", { ...scope, prompt: "插件的新聊天" });
+
+    const ack = Promise.withResolvers<boolean>();
+    vi.mocked(ipc.interruptSession).mockReturnValueOnce(ack.promise);
+    const stop = interruptPluginChatRun("pending-owner", scope);
+    await vi.waitFor(() => expect(vi.mocked(ipc.interruptSession).mock.calls).toEqual([["plugin-pending-run"]]));
+    const deliverTerminal = () => handleEngineEvents([{
+      engine: target.engine, runId: "plugin-pending-run", kind: "done", sessionId: null, seq: 1, data: {},
+    }], engineDeps());
+    if (early) {
+      deliverTerminal();
+      expect(useChatStore.getState().streamingByKey[pendingKey]).toBe(true);
+    }
+    ack.resolve(true);
+    await stop;
+    if (!early) deliverTerminal();
+    expect(useChatStore.getState().streamingByKey[pendingKey]).toBe(true);
+    expect(useChatStore.getState().bySession[pendingKey].interrupted).toBeFalsy();
+    await useChatStore.getState().interrupt({ ...scope, sessionId: null });
+    expect(ipc.interruptSession).toHaveBeenLastCalledWith("user-pending-run");
+  });
+
+  it("Bot 解析期间开始刷新历史时拒绝续接，不追加消息", async () => {
+    const bot = Promise.withResolvers<Awaited<ReturnType<typeof ipc.resolveEnabledBuiltInAgent>>>();
+    const page = Promise.withResolvers<Awaited<ReturnType<typeof ipc.loadSessionPage>>>();
+    vi.mocked(ipc.resolveEnabledBuiltInAgent).mockReturnValueOnce(bot.promise);
+    selectSelectedBot(WS, target.sessionId, { id: "builtin", name: "内置助手", source: "builtIn", avatar: { type: "emoji", value: "🤖" } });
+    try {
+      const start = startPluginChatRun("loading-owner", def);
+      await vi.waitFor(() => expect(ipc.resolveEnabledBuiltInAgent).toHaveBeenCalled());
+      const before = useChatStore.getState().bySession[key].messages;
+      vi.mocked(ipc.loadSessionPage).mockReturnValueOnce(page.promise);
+      const reload = useChatStore.getState().reloadSession(target);
+      expect(useChatStore.getState().bySession[key].loading).toBe(true);
+      bot.resolve({ id: "builtin", name: "内置助手", icon: null, prompt: "测试", promptHash: "test" });
+      try {
+        await expect(start).rejects.toThrow("session_busy");
+        expect(ipc.sendMessage).not.toHaveBeenCalled();
+        expect(useChatStore.getState().bySession[key].messages).toBe(before);
+      } finally {
+        page.resolve({ messages: [], nextBefore: null, subagentHistory: [] });
+        await reload;
+      }
+    } finally {
+      clearSelectedBot(WS, target.sessionId);
+    }
+  });
+
+  it("停止 IPC 失败后保留待发轮次并允许重试", async () => {
+    const scope = { engine: target.engine, workspacePath: WS };
+    vi.mocked(ipc.sendMessage).mockResolvedValueOnce({ runId: "retry-stop", sessionId: null });
+    await startPluginChatRun("retry-stop-owner", { ...scope, prompt: "待发" });
+    const stop = () => interruptPluginChatRun("retry-stop-owner", scope);
+    vi.mocked(ipc.interruptSession).mockRejectedValueOnce(new Error("IPC unavailable"));
+    await expect(stop()).rejects.toThrow("IPC unavailable");
+    vi.mocked(ipc.interruptSession).mockResolvedValueOnce(false);
+    await expect(stop()).rejects.toThrow();
+    expect(useChatStore.getState().streamingByKey[`new:${target.engine}:${WS}`]).toBe(true);
+    await stop();
+    expect(vi.mocked(ipc.interruptSession).mock.calls).toEqual([["retry-stop"], ["retry-stop"], ["retry-stop"]]);
+  });
+
+  it("停止已知会话期间不停止后发的用户轮次", async () => {
+    await startPluginChatRun("known-stop-owner", def);
+    const ack = Promise.withResolvers<boolean>();
+    vi.mocked(ipc.interruptSession).mockReturnValueOnce(ack.promise);
+    const stop = interruptPluginChatRun("known-stop-owner", def);
+    await vi.waitFor(() => expect(ipc.interruptSession).toHaveBeenCalledWith(target.sessionId));
+    vi.mocked(ipc.sendMessage).mockResolvedValueOnce({ runId: "replacement-user", sessionId: target.sessionId });
+    await useChatStore.getState().send("停止期间发送的新消息", [], undefined, def);
+    ack.resolve(true);
+    await stop;
+    expect(ipc.interruptSession).not.toHaveBeenCalledWith("replacement-user");
+    expect(useChatStore.getState().streamingByKey[key]).toBe(true);
+  });
+});
+
+describe("workspace default engine", () => {
+  beforeEach(() => {
+    resetStore();
+    useChatStore.setState({
+      workspaces: [{ id: "a", path: WS, name: "a", groupId: null, sortOrder: null, lastOpenedAt: null }],
+      engines: [{ id: "codex", enabled: true, available: true, supportsImages: true, permissions: [] }],
+      workspaceDefaultEngines: { a: "codex" },
+    });
+  });
+
+  it("publishes workspaces with their preferences when settings load slowly", async () => {
+    const { workspaces, engines } = useChatStore.getState();
+    useChatStore.setState({ workspaces: [], engines: [], workspaceDefaultEngines: {} });
+    const settings = Promise.withResolvers<Awaited<ReturnType<typeof ipc.getAppSettings>>>();
+    vi.mocked(ipc.getAppSettings).mockReturnValueOnce(settings.promise);
+    vi.mocked(ipc.listWorkspaces).mockResolvedValueOnce(workspaces);
+    vi.mocked(ipc.listEngines).mockResolvedValueOnce(engines);
+    const unsubscribe = useChatStore.subscribe((state, previous) => {
+      if (state.workspaces.length && !previous.workspaces.length) state.startNewChat(WS);
+    });
+    try {
+      const initialization = useChatStore.getState().init();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(useChatStore.getState().workspaces).toEqual([]);
+      settings.resolve({ ...await ipc.getAppSettings(), workspaceDefaultEngines: { a: "codex" } });
+      await initialization;
+      expect(useChatStore.getState().active?.engine).toBe("codex");
+      await useChatStore.getState().send("hello", []);
+      expect(ipc.sendMessage).toHaveBeenCalledWith(expect.objectContaining({ engine: "codex" }));
+    } finally {
+      unsubscribe();
+    }
+  });
+
+  it("uses the workspace engine for the pending tab, picker and first send", async () => {
+    const store = useChatStore.getState();
+    store.startNewChat(WS);
+    store.startNewChat(WS);
+    expect(useChatStore.getState()).toMatchObject({
+      activeEngine: "codex",
+      openTabs: [{ engine: "codex", sessionId: null, workspacePath: WS }],
+    });
+    await store.send("hello", []);
+    expect(ipc.sendMessage).toHaveBeenCalledWith(expect.objectContaining({ engine: "codex" }));
+  });
+
+  it.each(["workspace", "override", "picker"])("tracks a runtime switch only for the picker (%s)", (source) => {
+    useChatStore.setState({
+      active: { engine: "claude", sessionId: "old-session", workspacePath: WS },
+      activeEngine: source === "picker" ? "codex" : "claude",
+      workspaceDefaultEngines: source === "workspace" ? { a: "codex" } : {},
+    });
+    useChatStore.getState().startNewChat(WS, source === "override" ? "codex" : undefined);
+    const state = useChatStore.getState();
+    expect(state.active?.engine).toBe("codex");
+    if (source === "picker") {
+      expect(state.pendingRuntimeSwitch).toMatchObject({ sourceSessionId: "old-session", targetEngine: "codex" });
+    } else {
+      expect(state.pendingRuntimeSwitch).toBeNull();
+    }
+  });
+
+  it("keeps workspaces independent and permits a one-time override", () => {
+    const store = useChatStore.getState();
+    const workspace = store.workspaces[0]!;
+    useChatStore.setState({
+      workspaces: [workspace, { ...workspace, id: "b", path: "/other" }],
+      workspaceDefaultEngines: { a: "codex", b: "claude" },
+      engines: [...store.engines, { ...store.engines[0]!, id: "claude" }],
+    });
+    store.startNewChat(WS);
+    expect(useChatStore.getState().active?.engine).toBe("codex");
+    store.startNewChat("/other");
+    expect(useChatStore.getState().active?.engine).toBe("claude");
+    store.startNewChat(WS, "claude");
+    expect(useChatStore.getState().active?.engine).toBe("claude");
+    expect(useChatStore.getState().workspaceDefaultEngines).toEqual({ a: "codex", b: "claude" });
+    store.startNewChat(WS);
+    expect(useChatStore.getState().active?.engine).toBe("codex");
+  });
+
+  it.each([
+    [false, true, null, false],
+    [true, false, null, false],
+    [true, false, ["codex"], true],
+    [false, false, ["codex"], false],
+    [true, true, [], false],
+  ] as const)("checks availability for enabled=%s, installed=%s, delegated=%j", (enabled, available, delegated, accepted) => {
+    const store = useChatStore.getState();
+    useChatStore.setState({ engines: [{ ...store.engines[0]!, enabled, available }] });
+    window.__ccguiWorkspaceUI!.registerHooks({
+      allowedEngines: () => delegated === null ? null : [...delegated],
+      labelSuffix: () => null,
+    });
+    try {
+      store.startNewChat(WS);
+      const next = useChatStore.getState();
+      expect(next.active?.engine ?? null).toBe(accepted ? "codex" : null);
+      expect(next.unavailableNewChat?.engine ?? null).toBe(accepted ? null : "codex");
+      expect(next.workspaceDefaultEngines).toEqual({ a: "codex" });
+      expect(ipc.sendMessage).not.toHaveBeenCalled();
+    } finally {
+      window.__ccguiWorkspaceUI!.registerHooks(null);
+    }
+  });
+
+  it("runs new-chat cleanup only when creation succeeds", () => {
+    const store = useChatStore.getState();
+    const onOpened = vi.fn();
+    useChatStore.setState({ engines: [] });
+    store.startNewChat(WS, undefined, onOpened);
+    expect(onOpened).not.toHaveBeenCalled();
+    store.dismissUnavailableNewChat();
+    expect(onOpened).not.toHaveBeenCalled();
+
+    store.startNewChat(WS, undefined, onOpened);
+    const request = useChatStore.getState().unavailableNewChat;
+    store.startNewChat(WS, "claude", request?.onOpened);
+    expect(onOpened).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps the previous tab and draft when the default cannot be used", () => {
+    const store = useChatStore.getState();
+    store.startNewChat("/other");
+    const previous = useChatStore.getState().active;
+    useChatStore.setState({ engines: [], drafts: { untouched: "draft" } });
+    store.startNewChat(WS);
+    expect(useChatStore.getState()).toMatchObject({
+      active: previous,
+      drafts: { untouched: "draft" },
+      unavailableNewChat: { workspacePath: WS, engine: "codex" },
+    });
+    store.dismissUnavailableNewChat();
+    expect(useChatStore.getState().active).toBe(previous);
+  });
+
+  it("lets a picker change on an established chat win over the default in that workspace only", () => {
+    const codex = useChatStore.getState().engines[0]!;
+    const established = (workspacePath: string) => ({
+      active: { engine: "claude", sessionId: "old-session", workspacePath },
+      activeEngine: "gemini",
+    });
+    useChatStore.setState({
+      ...established(WS),
+      engines: [codex, { ...codex, id: "claude" }, { ...codex, id: "gemini" }],
+    });
+    useChatStore.getState().startNewChat(WS);
+    expect(useChatStore.getState().active?.engine).toBe("gemini");
+    expect(useChatStore.getState().pendingRuntimeSwitch).toMatchObject({
+      sourceSessionId: "old-session",
+      targetEngine: "gemini",
+    });
+
+    useChatStore.setState({ ...established("/other"), pendingRuntimeSwitch: null });
+    useChatStore.getState().startNewChat(WS);
+    expect(useChatStore.getState().active?.engine).toBe("codex");
+    expect(useChatStore.getState().pendingRuntimeSwitch).toBeNull();
+  });
+
+  it("keeps the first request's cleanup when the dialog is requested again", () => {
+    const store = useChatStore.getState();
+    const first = vi.fn();
+    const second = vi.fn();
+    useChatStore.setState({ engines: [] });
+    store.startNewChat(WS, undefined, first);
+    store.startNewChat(WS, undefined, second);
+    store.startNewChat(WS, "claude", useChatStore.getState().unavailableNewChat?.onOpened);
+    expect(first).toHaveBeenCalledTimes(1);
+    expect(second).not.toHaveBeenCalled();
+  });
+
+  it("runs the open callback before the new tab activates", () => {
+    let activeDuringCallback: unknown = "unset";
+    useChatStore.getState().startNewChat(WS, undefined, () => {
+      activeDuringCallback = useChatStore.getState().active;
+    });
+    expect(activeDuringCallback).toBeNull();
+    expect(useChatStore.getState().active?.engine).toBe("codex");
   });
 });

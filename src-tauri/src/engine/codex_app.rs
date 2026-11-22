@@ -1598,6 +1598,29 @@ struct TurnStarted {
     turn_id: Option<String>,
 }
 
+/// `clientInfo` is required, but Codex treats `codex-backend` as a
+/// non-originating client: it leaves the CLI's process-wide originator and UA
+/// suffix untouched. Do not send the host's name or version here, or hard-code
+/// a User-Agent that will drift from the CLI.
+///
+/// Known consequences (codex 0.167 source, recheck
+/// `app-server/src/request_processors/initialize_processor.rs` on upgrades):
+/// - The exemption list (`NON_ORIGINATING_CLIENT_NAMES`) exists since 0.131;
+///   older CLIs adopt `codex-backend` as the originator.
+/// - The default originator `codex_cli_rs` counts as first-party, which
+///   unlocks skill MCP-dependency auto-install; `CodexEngine::host_command`
+///   disables that feature.
+/// - Since 0.157 a non-originating client never enables automatic browser
+///   sign-in for gateway-OAuth providers: a missing or rejected gateway token
+///   fails with "Gateway sign-in required" until the user signs in with Codex.
+/// - Codex hooks receive `client: "codex-backend"`.
+fn initialize_params(experimental: bool) -> Value {
+    json!({
+        "clientInfo": { "name": "codex-backend", "version": "" },
+        "capabilities": { "experimentalApi": experimental },
+    })
+}
+
 /// `initialize` → thread → [plan-item verification] → `turn/start`, up to the
 /// turn's acknowledgement. `decision` marks a plan-decision turn: the reviewed
 /// plan item is re-fetched and compared first, and the turn starts in the
@@ -1625,13 +1648,7 @@ async fn handshake_and_start(
         || decision.is_some()
         || req.permission.as_deref() == Some("plan");
     let key = server
-        .request(
-            "initialize",
-            json!({ "clientInfo": {
-                "name": "ccgui",
-                "version": env!("CARGO_PKG_VERSION"),
-            }, "capabilities": {"experimentalApi": experimental}}),
-        )
+        .request("initialize", initialize_params(experimental))
         .await?;
     let initialized = server
         .pump(
@@ -1747,6 +1764,9 @@ async fn handshake_and_start(
                 comparison_model: None,
                 model: req.model.clone(),
                 effort: req.effort.clone(),
+                // The thread's effective settings follow right below as the
+                // served side.
+                reports_served: true,
             },
         );
     }
@@ -1836,6 +1856,22 @@ async fn handshake_and_start(
         // shapes is sent. A missing model is schema-invalid — fail closed.
         turn_params["collaborationMode"] =
             plan_collaboration(req.model.as_deref(), thread_model.as_deref(), req.effort.as_deref())?;
+    } else if let Some(model) = req
+        .session_id
+        .as_ref()
+        .filter(|_| !codex_read_only::requested(req))
+        .and(req.model.as_deref().or(thread_model.as_deref()))
+        .filter(|m| !m.trim().is_empty())
+    {
+        // An earlier planning turn left "Plan Mode until a developer message
+        // ends it" in the thread; codex only appends that ending when a turn
+        // restates the mode (measured on 0.169). Never-planned threads get one
+        // harmless Default note, appended once.
+        turn_params["collaborationMode"] = collaboration_mode(
+            "default",
+            model,
+            req.effort.as_deref().or(reported_effort.as_deref()),
+        );
     } else {
         if let Some(effort) = req.effort.as_deref() {
             turn_params["effort"] = json!(effort);
@@ -2021,6 +2057,7 @@ pub(crate) async fn run_plan_decision(
         computer_use: None,
         memory_bot: None,
         allowed_tools: None,
+        no_tools: false,
     };
     let mut built = super::codex::CodexEngine.host_command(&req, &bin)?;
     built.command.current_dir(&req.workspace);
@@ -2052,6 +2089,7 @@ pub(crate) async fn run_plan_decision(
     };
     {
         let mut map = state.processes.0.lock().map_err(|e| e.to_string())?;
+        state.processes.ensure_session_not_editing(Some(&thread_id))?;
         if super::registry::active_run_count(&map) >= super::MAX_CONCURRENT_RUNS {
             return Err(format!(
                 "too many concurrent runs ({}); wait for one to finish",
@@ -2059,8 +2097,8 @@ pub(crate) async fn run_plan_decision(
             ));
         }
         map.insert(run_id.clone(), entry.clone());
+        map.entry(thread_id.clone()).or_insert(entry);
     }
-    state.processes.insert_alias(thread_id.clone(), entry);
 
     let core = TurnCore {
         sink: Arc::clone(&state.sink),
@@ -2363,6 +2401,7 @@ mod tests {
             computer_use: None,
             memory_bot: None,
             allowed_tools: None,
+            no_tools: false,
         };
         assert!(crate::engine::codex::CodexEngine
             .build_command(&request, &bin)
@@ -2380,7 +2419,7 @@ mod tests {
         let killed = AtomicBool::new(false);
         let result: Result<(),String> = async {
             for (method,params) in [
-                ("initialize",json!({"clientInfo":{"name":"ccgui_probe","version":"1"},"capabilities":{"experimentalApi":true}})),
+                ("initialize",initialize_params(true)),
                 ("configRequirements/read",json!({})),
                 ("config/read",json!({"cwd":workspace,"includeLayers":true})),
                 ("thread/start",json!({"cwd":workspace,"model":"probe","sandbox":"read-only","approvalPolicy":"never","ephemeral":true,"dynamicTools":[],"selectedCapabilityRoots":[],"environments":[{"environmentId":"local","cwd":workspace}]})),
@@ -2448,6 +2487,7 @@ mod tests {
             computer_use: None,
             memory_bot: None,
             allowed_tools: None,
+            no_tools: false,
         };
         let built = BuiltCommand {
             command,
@@ -2747,10 +2787,14 @@ require('node:readline').createInterface({input: process.stdin}).on('line', line
     assert.equal(params.threadId, 'thread-123');
     assert.equal(params.input[0].text, 'Continue the conversation');
     assert.equal(params.history, undefined);
-    if (mode === 'decision') {
+    if (resumed) {
+      // A plain resumed turn restates Default too: an earlier planning turn
+      // left Plan Mode instructions in the thread that only a mode change ends.
       assert.equal(params.collaborationMode.mode, 'default');
       assert.equal(params.collaborationMode.settings.model, 'test-model');
       assert.equal(params.collaborationMode.settings.reasoning_effort, 'high');
+    } else {
+      assert.equal(params.collaborationMode, undefined);
     }
     result = {turn: {id: 'next-turn'}};
   }
@@ -2785,6 +2829,7 @@ require('node:readline').createInterface({input: process.stdin}).on('line', line
                 computer_use: None,
                 memory_bot: None,
                 allowed_tools: None,
+                no_tools: false,
             };
             let decision = (mode == "decision").then(|| DecisionCheck {
                 mode: "default",
@@ -2873,6 +2918,7 @@ require('node:readline').createInterface({input: process.stdin}).on('line', line
                 computer_use: None,
                 memory_bot: None,
                 allowed_tools: None,
+                no_tools: false,
             };
             let (core, _registry, _emitter) = test_core();
             let killed = Arc::new(AtomicBool::new(false));

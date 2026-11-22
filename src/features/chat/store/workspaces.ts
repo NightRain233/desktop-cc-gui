@@ -1,10 +1,12 @@
 import { ipc, type WorkspaceGroup } from "@/lib/ipc";
 import { errorText } from "@/lib/errors";
+import i18n from "@/lib/i18n";
 import { newId } from "@/lib/id";
 import { pruneMentionIndex } from "@/components/application/ai-chat/mention-files";
 import { pruneSlashCommands } from "@/components/application/ai-chat/slash-commands";
 import { persistTabs, sessionKey, type ActiveSession } from "./persistence";
 import { persistSettings } from "./settings-persist";
+import { withoutComposerAttachments } from "./attachments";
 import type { ChatStore } from "./types";
 import type { StoreGet, StoreSet } from "./context";
 
@@ -27,12 +29,14 @@ export function createWorkspaceActions(
   | "refreshWorkspaces"
   | "addWorkspaces"
   | "reorderWorkspaces"
+  | "setWorkspacePinned"
   | "removeWorkspace"
   | "createWorkspaceGroup"
   | "renameWorkspaceGroup"
   | "reorderWorkspaceGroups"
   | "deleteWorkspaceGroup"
   | "assignWorkspaceGroup"
+  | "setWorkspaceDefaultEngine"
   | "setWorkspaceAlias"
   | "setWorkspaceArchived"
 > {
@@ -88,6 +92,23 @@ export function createWorkspaceActions(
       }
     },
 
+    setWorkspacePinned: async (id, pinned) => {
+      const previous = get().workspaces.find((w) => w.id === id)?.pinned ?? false;
+      set((s) => ({
+        workspaces: s.workspaces.map((w) => w.id === id ? { ...w, pinned } : w),
+      }));
+      try {
+        await ipc.setWorkspacePinned(id, pinned);
+        set({ actionError: null });
+      } catch (error) {
+        set((s) => ({
+          workspaces: s.workspaces.map((w) => w.id === id ? { ...w, pinned: previous } : w),
+        }));
+        await get().refreshWorkspaces();
+        set({ actionError: i18n.t("chat.pinWorkspaceFailed", { message: errorText(error) }) });
+      }
+    },
+
     removeWorkspace: async (id) => {
       try {
         const removedPath = get().workspaces.find((w) => w.id === id)?.path;
@@ -112,6 +133,8 @@ export function createWorkspaceActions(
           ...Object.keys(current.bySession),
           ...Object.keys(current.drafts),
           ...Object.keys(current.unseen),
+          // A pending chat may hold only pictures: no draft, no session yet.
+          ...Object.keys(current.composerAttachments),
         ]) {
           if (key.startsWith("new:") && key.endsWith(`:${removedPath}`)) {
             dead.add(key);
@@ -128,7 +151,15 @@ export function createWorkspaceActions(
               delete drafts[key];
               delete unseen[key];
             }
-            return { bySession, drafts, unseen };
+            return {
+              bySession,
+              drafts,
+              unseen,
+              composerAttachments: withoutComposerAttachments(
+                s.composerAttachments,
+                dead,
+              ),
+            };
           });
         }
         const openTabs = get().openTabs.filter(
@@ -236,6 +267,10 @@ export function createWorkspaceActions(
         await get().refreshWorkspaces();
         throw error;
       }
+    },
+    setWorkspaceDefaultEngine: async (workspaceId, engine) => {
+      const workspaceDefaultEngines = await ipc.setWorkspaceDefaultEngine(workspaceId, engine);
+      set({ workspaceDefaultEngines });
     },
     setWorkspaceAlias: async (workspaceId, alias) => {
       // An alias equal to the folder name is no alias at all — same rule the

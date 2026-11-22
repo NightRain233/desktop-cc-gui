@@ -22,6 +22,8 @@ import { createSessionActions } from "./store/sessions";
 import { createWorkspaceActions } from "./store/workspaces";
 import { createPreferenceActions } from "./store/preferences";
 import { createComposerActions } from "./store/composer";
+import { NO_ATTACHMENT_MOVES, NO_COMPOSER_ATTACHMENTS } from "./store/attachments";
+import { watchSessionSelection } from "./store/selection";
 import type { ChatStore } from "./store/types";
 
 // Facade re-exports: callers keep importing everything from "../store".
@@ -51,6 +53,7 @@ function loadHistoryPage(
   limit?: number,
   beforeSeq?: number | null,
   meta?: SessionMeta,
+  forceReload?: boolean,
 ): Promise<SessionPage> {
   const m =
     meta ??
@@ -63,15 +66,10 @@ function loadHistoryPage(
           s.workspacePath === workspacePath,
       );
   if (m?.remote && m.remotePath) {
-    return ipc.loadRemoteSessionPage(
-      workspacePath,
-      engine,
-      sessionId,
-      m.remotePath,
-      limit,
-      beforeSeq,
-    );
+    if (forceReload) return ipc.loadRemoteSessionPage(workspacePath, engine, sessionId, m.remotePath, limit, beforeSeq, true);
+    return ipc.loadRemoteSessionPage(workspacePath, engine, sessionId, m.remotePath, limit, beforeSeq);
   }
+  if (forceReload) return ipc.loadSessionPage(engine, sessionId, limit, beforeSeq, true);
   return beforeSeq === undefined
     ? ipc.loadSessionPage(engine, sessionId, limit)
     : ipc.loadSessionPage(engine, sessionId, limit, beforeSeq);
@@ -188,6 +186,9 @@ export const useChatStore = create<ChatStore>((set, get) => {
     threadLimit: 10,
     workspaceGroups: [],
     workspaceAliases: {},
+    workspaceDefaultEngines: {},
+    unavailableNewChat: null,
+    dismissUnavailableNewChat: () => set({ unavailableNewChat: null }),
     archivedWorkspaces: [],
     sendShortcut: "enter",
     thinkingAutoCollapse: true,
@@ -195,8 +196,11 @@ export const useChatStore = create<ChatStore>((set, get) => {
     bySession: {},
     streamingByKey: {},
     retryingByKey: {},
+    forkingByKey: {},
     unseen: {},
     drafts: {},
+    composerAttachments: NO_COMPOSER_ATTACHMENTS,
+    composerAttachmentMoves: NO_ATTACHMENT_MOVES,
     pendingMention: null,
     actionError: null,
     initialized: false,
@@ -213,6 +217,12 @@ export const useChatStore = create<ChatStore>((set, get) => {
     ...messagingActions,
   };
 });
+
+// Plugins follow the active session's provider/model through every path that
+// moves it, not only the composer pickers (session://selection-changed).
+eventTeardowns.push(
+  watchSessionSelection((listener) => useChatStore.subscribe(listener)),
+);
 
 // Dev-only handle for poking the store from the webview console; stripped
 // from production builds by the env guard.

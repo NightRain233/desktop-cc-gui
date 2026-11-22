@@ -1,7 +1,7 @@
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import "@/lib/i18n";
+import i18n from "@/lib/i18n";
 import type { AiChatRepo } from "@/components/application/ai-chat/ai-chat-sidebar";
 import { ipc, type SessionMeta, type Workspace } from "@/lib/ipc";
 import { useBrowserStore } from "@/features/browser/store";
@@ -12,7 +12,7 @@ import { usePluginHubStore } from "@/features/plugins/hub/store";
 import { usePluginTabsStore } from "@/features/plugins/runtime/center-tabs";
 import { useChatStore } from "./store";
 import { UNBOUND_DRAFT_KEY } from "./store/persistence";
-import { useChatSidebar } from "./use-chat-sidebar";
+import { sessionFileLocation, useChatSidebar } from "./use-chat-sidebar";
 // 命名空间导入：vi.mocked 必须走属性访问，命名导入会抛错。
 import * as platform from "@/lib/platform";
 
@@ -24,6 +24,8 @@ vi.mock("@/lib/ipc", async (importOriginal) => ({
     // 无工作区时 handleAddWorkspace 会走这条链路：登记目录 + 重读列表。
     addWorkspace: vi.fn(async () => {}),
     listWorkspaces: vi.fn(async () => []),
+    setWorkspacePinned: vi.fn(async () => {}),
+    revealInFileManager: vi.fn(async () => {}),
 
   
   },
@@ -124,6 +126,48 @@ describe("useChatSidebar repo mapping", () => {
     expect(captured).toHaveLength(1);
     expect(captured[0]?.threadLimit).toBe(7);
     expect(captured[0]?.threads.map((t) => t.id)).toEqual(["codex/s-1"]);
+  });
+
+  it("只在所属分组内把置顶工作区排在普通工作区前", async () => {
+    await act(async () => {
+      useChatStore.setState({
+        workspaces: [
+          { ...WS, id: "a", pinned: false, groupId: null },
+          { ...WS, id: "b", pinned: true, groupId: "g" },
+          { ...WS, id: "c", pinned: false, groupId: "g" },
+          { ...WS, id: "d", pinned: true, groupId: null },
+        ],
+        workspaceGroups: [{ id: "g", name: "分组", sortOrder: 0 }],
+      });
+    });
+    expect(sidebar.sections?.map((section) => section.repos.map((repo) => repo.id))).toEqual([
+      ["d", "a"],
+      ["b", "c"],
+    ]);
+    expect(sidebar.sections?.[0]?.repos[0]?.defaultOpen).toBe(true);
+    expect(sidebar.sections?.[1]?.repos[0]?.defaultOpen).toBe(false);
+  });
+
+  it("没有自定义分组时置顶项在工作区列表顶部", async () => {
+    await act(async () => {
+      useChatStore.setState({
+        workspaces: [{ ...WS, id: "a", pinned: false }, { ...WS, id: "b", pinned: true }],
+      });
+    });
+    expect(sidebar.sections).toBeUndefined();
+    expect(captured.map((repo) => repo.id)).toEqual(["b", "a"]);
+  });
+
+  it("置顶写入失败且刷新失败时恢复原状态并显示错误", async () => {
+    vi.mocked(ipc.setWorkspacePinned).mockRejectedValueOnce(new Error("写入失败"));
+    vi.mocked(ipc.listWorkspaces).mockRejectedValueOnce(new Error("刷新失败"));
+    await act(async () => {
+      await useChatStore.getState().setWorkspacePinned(WS.id, true);
+    });
+    expect(useChatStore.getState().workspaces[0]?.pinned).toBe(false);
+    expect(useChatStore.getState().actionError).toBe(
+      i18n.t("chat.pinWorkspaceFailed", { message: "写入失败" }),
+    );
   });
 
   it("pending 新对话出现在对应工作区线程列表顶部", async () => {
@@ -547,5 +591,58 @@ describe("首启草稿迁移", () => {
     expect(drafts["new:codex:/ws/a"]).toBe("这个会话自己的草稿");
     expect(drafts["new:codex:/ws/b"]).toBe("无归属");
     expect(UNBOUND_DRAFT_KEY in drafts).toBe(false);
+  });
+});
+
+describe("会话右键：复制文件路径 / 打开文件路径", () => {
+  const OPENCODE: SessionMeta = { ...SESSION, engine: "opencode", sessionId: "ses_1", filePath: "/data/opencode.db\u001fses_1" };
+  const REMOTE: SessionMeta = { ...SESSION, sessionId: "r-1", remote: true, remotePath: "/home/u/.codex/r-1.jsonl" };
+  let handle: ReturnType<typeof useChatSidebar>;
+
+  function MapHarness() {
+    handle = useChatSidebar({
+      sessionById: new Map([["codex/s-1", SESSION], ["opencode/ses_1", OPENCODE], ["codex/r-1", REMOTE]]),
+      threadStreaming: [],
+      threadRetrying: [],
+      collapseSidebarOnMobile: () => {},
+      composerInputRef: { current: null },
+      setDialog: () => {},
+    });
+    return null;
+  }
+
+  beforeEach(async () => {
+    vi.mocked(ipc.revealInFileManager).mockReset().mockResolvedValue(undefined);
+    useChatStore.setState({ workspaces: [WS], sessions: [], openTabs: [], actionError: null });
+    container = document.createElement("div");
+    document.body.appendChild(container);
+    root = createRoot(container);
+    await act(async () => root.render(<MapHarness />));
+  });
+
+  afterEach(async () => {
+    await act(async () => root.unmount());
+    container.remove();
+  });
+
+  it("本地给原文件路径，OpenCode 数据库会话给真实 db 文件，远端给环境内路径", () => {
+    expect(sessionFileLocation(SESSION)).toBe("/local/s-1.jsonl");
+    expect(sessionFileLocation(OPENCODE)).toBe("/data/opencode.db");
+    expect(sessionFileLocation(REMOTE)).toBe("/home/u/.codex/r-1.jsonl");
+  });
+
+  it("打开文件路径在文件管理器中定位真实文件，失败时提示而不是静默", async () => {
+    await act(async () => handle.handleThreadAction("opencode/ses_1", "reveal"));
+    expect(ipc.revealInFileManager).toHaveBeenCalledWith("/data/opencode.db");
+
+    vi.mocked(ipc.revealInFileManager).mockRejectedValueOnce(new Error("gone"));
+    await act(async () => handle.handleThreadAction("codex/s-1", "reveal"));
+    expect(useChatStore.getState().actionError).toContain("gone");
+  });
+
+  it("远端会话不调用本机文件管理器，直接说明原因", async () => {
+    await act(async () => handle.handleThreadAction("codex/r-1", "reveal"));
+    expect(ipc.revealInFileManager).not.toHaveBeenCalled();
+    expect(useChatStore.getState().actionError).toBeTruthy();
   });
 });

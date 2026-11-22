@@ -3,6 +3,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { workspaceMenuRegistry, type Disposer } from "@ccgui/plugin-sdk";
 import i18n from "@/lib/i18n";
+import { useChatStore } from "@/features/chat/store";
 import { WorkspaceContextMenu } from "./workspace-context-menu";
 
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
@@ -19,6 +20,7 @@ describe("workspace menu plugin isolation", () => {
   const menu = { x: 10, y: 10, workspaceId: "menu-workspace", archived: false };
 
   beforeEach(() => {
+    useChatStore.setState({ workspaces: [], workspaceDefaultEngines: {}, engines: [] });
     disposers = [];
     container = document.createElement("div");
     document.body.appendChild(container);
@@ -35,6 +37,56 @@ describe("workspace menu plugin isolation", () => {
   function menuItems(): HTMLButtonElement[] {
     return [...document.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')];
   }
+
+  it("右键工作区切换置顶，归档行不提供置顶", () => {
+    useChatStore.setState({ workspaces: [{ id: menu.workspaceId, path: "/ws", name: "ws", lastOpenedAt: null, sortOrder: 0, groupId: null, pinned: false }] });
+    const onSetPinned = vi.fn();
+    act(() => root.render(<WorkspaceContextMenu menu={menu} onClose={() => {}} onSetPinned={onSetPinned} />));
+    const pin = menuItems().find((button) => button.textContent === i18n.t("chat.pinWorkspace"));
+    expect(pin).toBeDefined();
+    act(() => pin!.click());
+    expect(onSetPinned).toHaveBeenCalledWith(menu.workspaceId, true);
+
+    act(() => useChatStore.setState({ workspaces: useChatStore.getState().workspaces.map((w) => ({ ...w, pinned: true })) }));
+    expect(menuItems().some((button) => button.textContent === i18n.t("chat.unpinWorkspace"))).toBe(true);
+
+    act(() => root.render(<WorkspaceContextMenu menu={{ ...menu, archived: true }} onClose={() => {}} onSetPinned={onSetPinned} />));
+    expect(menuItems().some((button) => button.textContent === i18n.t("chat.unpinWorkspace"))).toBe(false);
+
+    act(() => useChatStore.setState({ workspaces: [{ ...useChatStore.getState().workspaces[0]!, parentId: "parent", kind: "worktree" }] }));
+    act(() => root.render(<WorkspaceContextMenu menu={menu} onClose={() => {}} onSetPinned={onSetPinned} />));
+    expect(menuItems().some((button) => button.textContent === i18n.t("chat.unpinWorkspace"))).toBe(false);
+  });
+
+  it("copies the right-clicked workspace's full path", async () => {
+    useChatStore.setState({ workspaces: [{ id: menu.workspaceId, path: "/Users/me/ws", name: "ws", lastOpenedAt: null, sortOrder: 0, groupId: null }] });
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    vi.stubGlobal("navigator", { ...navigator, clipboard: { writeText } });
+    const onClose = vi.fn();
+    act(() => root.render(<WorkspaceContextMenu menu={menu} onClose={onClose} />));
+    const item = menuItems().find((button) => button.textContent === i18n.t("files.copyPath"));
+    expect(item).toBeDefined();
+    await act(async () => item!.click());
+    expect(writeText).toHaveBeenCalledWith("/Users/me/ws");
+    expect(onClose).toHaveBeenCalled();
+    vi.unstubAllGlobals();
+  });
+
+  it("opens the default engine picker for the right-clicked workspace", () => {
+    useChatStore.setState({
+      workspaces: [{ id: menu.workspaceId, path: "/ws", name: "ws", lastOpenedAt: null, sortOrder: 0, groupId: null }],
+      workspaceDefaultEngines: { [menu.workspaceId]: "codex" },
+      engines: [{ id: "codex", enabled: true, available: true, supportsImages: true, permissions: [] }],
+    });
+    act(() => root.render(<WorkspaceContextMenu menu={menu} onClose={() => {}} onSetArchived={() => {}} />));
+    const item = menuItems().find((button) => button.textContent === i18n.t("chat.workspaceDefaultEngine"));
+    expect(item).toBeDefined();
+    expect(menuItems()[0]?.textContent).toBe(i18n.t("files.copyPath"));
+    expect(menuItems()[1]).toBe(item);
+    expect(menuItems()[2]?.textContent).toBe(i18n.t("chat.archiveWorkspace"));
+    act(() => item!.click());
+    expect(document.querySelector('[role="dialog"] button[aria-haspopup="listbox"]')?.textContent).toContain(i18n.t("settings.engines.codex"));
+  });
 
   it("keeps the workspace alias action usable when a plugin icon crashes", () => {
     const BrokenIcon = () => {

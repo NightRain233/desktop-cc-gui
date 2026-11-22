@@ -2,36 +2,9 @@ use serde::Deserialize;
 use serde_json::Value;
 use tauri::Manager;
 
-use super::{web_access_status, web_device_approve, web_device_revoke, web_devices};
+use super::{web_access_status, web_device_revoke, web_devices};
 
 // ==================== Command dispatch ====================
-
-#[derive(Deserialize)]
-struct RelayArgs {
-    url: String,
-    key: String,
-}
-
-#[derive(Deserialize)]
-struct RelayUnattendedArgs {
-    enabled: bool,
-}
-
-#[derive(Deserialize)]
-struct RelayDeployPackArgs {
-    path: String,
-    key: Option<String>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct RelayDeployArgs {
-    token: String,
-    /// Absent for user tokens, which can list their accounts; required in
-    /// practice for account-owned ones (`cfat_…`).
-    #[serde(default)]
-    account_id: Option<String>,
-}
 
 #[derive(Deserialize)]
 struct DeviceIdArgs {
@@ -224,6 +197,19 @@ struct PluginHostArgs {
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct PluginUsageQueryArgs {
+    plugin_id: String,
+    query: crate::usage_stats::QueryRequest,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PluginLimitsArgs {
+    plugin_id: String,
+    providers: Option<Vec<String>>,
+    refresh: Option<bool>,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct PluginEngineArgs {
     plugin_id: String,
     engine: String,
@@ -261,6 +247,7 @@ struct LoadSessionPageArgs {
     session_id: String,
     limit: Option<usize>,
     before_seq: Option<i64>,
+    force_reload: Option<bool>,
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -271,6 +258,25 @@ struct LoadRemoteSessionPageArgs {
     remote_path: String,
     limit: Option<usize>,
     before_seq: Option<i64>,
+    force_reload: Option<bool>,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SessionFileArgs {
+    engine: String,
+    session_id: String,
+    workspace_path: Option<String>,
+    remote_path: Option<String>,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WriteSessionFileArgs {
+    engine: String,
+    session_id: String,
+    content: String,
+    expected_version: String,
+    workspace_path: Option<String>,
+    remote_path: Option<String>,
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -280,16 +286,13 @@ struct DeleteRemoteSessionArgs {
     session_id: String,
     remote_path: String,
 }
+/// 会话分叉：`at` 省略即 tip 分叉（完整轮次末尾）。
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct UsageSummaryArgs {
-    days: u32,
-    tz_offset_minutes: i32,
-}
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct UsageRecordArgs {
-    entry: crate::usage::UsageEntry,
+struct ForkSessionArgs {
+    engine: String,
+    session_id: String,
+    at: Option<crate::engine::fork::ForkAnchor>,
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -364,6 +367,7 @@ struct ListDirArgs {
 #[serde(rename_all = "camelCase")]
 struct PathArgs {
     path: String,
+    encoding: Option<String>,
     /// Optional workspace meta passthrough (plugin workspaces.add keeps
     /// transport descriptions alive on the web runtime too).
     meta: Option<serde_json::Value>,
@@ -398,6 +402,12 @@ struct IdsArgs {
 #[serde(rename_all = "camelCase")]
 struct IdArgs {
     id: String,
+}
+
+#[derive(Deserialize)]
+struct SetWorkspacePinnedArgs {
+    id: String,
+    pinned: bool,
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -508,6 +518,9 @@ struct SetWorkspaceGroupArgs {
 struct WriteFileArgs {
     path: String,
     content: String,
+    encoding: Option<String>,
+    bom: Option<bool>,
+    line_ending: Option<String>,
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -610,6 +623,55 @@ struct TerminalResizeArgs {
     rows: u16,
 }
 
+/// Error prefix of commands the bridge refuses (the frontend shows them as a
+/// desktop-only notice).
+const DESKTOP_ONLY_PREFIX: &str = "desktop-only: ";
+
+/// Changing how this desktop is reached (relay target, on/off, unattended
+/// autostart, worker deploy) or who may reach it (device approval) needs
+/// someone at the desktop. A leaked LAN token or an approved phone must not be
+/// able to turn one visit into a standing backdoor. Revoking stays remote: it
+/// only ever narrows access.
+fn desktop_only_refusal(cmd: &str) -> Option<String> {
+    matches!(
+        cmd,
+        "web_relay_start"
+            | "web_relay_stop"
+            | "web_relay_unattended"
+            | "web_relay_unattended_set"
+            | "relay_deploy_pack"
+            | "relay_deploy"
+            | "web_device_approve"
+    )
+    .then(|| format!("{DESKTOP_ONLY_PREFIX}{cmd} is only available on the desktop"))
+}
+
+/// Remote sends never mount the computer-use driver: screen capture and input
+/// injection need someone at the machine, and the global Esc stop only arms
+/// for sends made on the desktop.
+fn remote_computer_use(_requested: Option<bool>) -> Option<bool> {
+    None
+}
+
+/// A remote settings write keeps everything that decides who can reach the
+/// desktop — and the analytics switch, which is desktop-only too — at the
+/// desktop's current values. Ordinary preferences still follow the client.
+fn keep_desktop_owned_settings(
+    mut incoming: crate::settings::AppSettings,
+    current: &crate::settings::AppSettings,
+) -> crate::settings::AppSettings {
+    incoming.web_auth_enabled = current.web_auth_enabled;
+    incoming.web_auth_key = current.web_auth_key.clone();
+    incoming.web_relay_url = current.web_relay_url.clone();
+    incoming.web_relay_key = current.web_relay_key.clone();
+    incoming.web_relay_unattended = current.web_relay_unattended;
+    incoming.web_access_auto_start = current.web_access_auto_start;
+    incoming.web_access_port = current.web_access_port;
+    incoming.web_access_token = current.web_access_token.clone();
+    incoming.analytics_enabled = current.analytics_enabled;
+    incoming
+}
+
 /// Routes a bridge invoke to the same command functions the Tauri handler
 /// uses. Sync commands run inline: the heaviest (git diff, config writes) are
 /// milliseconds-scale, and the per-invoke tokio task keeps the read loop
@@ -620,6 +682,9 @@ pub(super) async fn dispatch(
     cmd: &str,
     raw: Value,
 ) -> Result<Value, String> {
+    if let Some(refusal) = desktop_only_refusal(cmd) {
+        return Err(refusal);
+    }
     match cmd {
         // config
         "get_cli_config" => ser(crate::config::get_cli_config()),
@@ -702,11 +767,22 @@ pub(super) async fn dispatch(
         }
         // settings
         "get_app_settings" => ser(crate::settings::get_app_settings()),
+        "set_workspace_default_engine" => {
+            #[derive(serde::Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct Args {
+                workspace_id: String,
+                engine: String,
+            }
+            let a: Args = parse_args(&raw)?;
+            ser(crate::settings::set_workspace_default_engine(app.clone(), a.workspace_id, a.engine))
+        }
         "update_app_settings" => {
             let a: UpdateSettingsArgs = parse_args(&raw)?;
-            ser(crate::settings::update_app_settings(
+            ser(crate::settings::update_app_settings_merged(
                 app.clone(),
                 a.settings,
+                Some(keep_desktop_owned_settings),
             ))
         }
         // engine
@@ -726,10 +802,14 @@ pub(super) async fn dispatch(
                 a.permission,
                 a.provider_id,
                 a.run_id,
-                a.computer_use,
+                remote_computer_use(a.computer_use),
                 a.memory_bot,
             )
             .await)
+        }
+        "close_idle_codebuddy" => {
+            let a: SessionIdArgs = parse_args(&raw)?;
+            ser(crate::engine::close_idle_codebuddy(app.state(), a.session_id).await)
         }
         "interrupt_session" => {
             let a: SessionIdArgs = parse_args(&raw)?;
@@ -740,6 +820,12 @@ pub(super) async fn dispatch(
         "live_runs" => {
             let a: RunIdsArgs = parse_args(&raw)?;
             ser(crate::engine::live_runs(app.state(), a.run_ids).await)
+        }
+        // Run-status panel: read-only facts about runs the client already
+        // observes (timestamps, tool names, retry reasons), same as desktop.
+        "run_activity" => {
+            let a: RunIdsArgs = parse_args(&raw)?;
+            ser(crate::engine::run_activity(a.run_ids).await)
         }
         // The remote UI renders the same AskUserQuestion card as the desktop
         // (events already reach it); without this case its 提交/忽略 buttons
@@ -783,6 +869,40 @@ pub(super) async fn dispatch(
             )
             .await)
         }
+        // Usage statistics & subscription limits: read-only data the desktop
+        // computes; the remote client renders the same plugin, and every
+        // call re-checks usage.read / limits.read in plugin_usage.
+        "plugin_usage_query" => {
+            let a: PluginUsageQueryArgs = parse_args(&raw)?;
+            ser(crate::plugin_usage::plugin_usage_query(app.clone(), a.plugin_id, a.query).await)
+        }
+        "plugin_usage_sources" => {
+            let a: PluginHostArgs = parse_args(&raw)?;
+            ser(crate::plugin_usage::plugin_usage_sources(app.clone(), a.plugin_id).await)
+        }
+        "plugin_usage_refresh" => {
+            let a: PluginHostArgs = parse_args(&raw)?;
+            ser(crate::plugin_usage::plugin_usage_refresh(app.clone(), a.plugin_id).await)
+        }
+        "plugin_usage_rescan" => {
+            let a: PluginHostArgs = parse_args(&raw)?;
+            ser(crate::plugin_usage::plugin_usage_rescan(app.clone(), a.plugin_id).await)
+        }
+        "plugin_usage_prices" => {
+            let a: PluginHostArgs = parse_args(&raw)?;
+            ser(crate::plugin_usage::plugin_usage_prices(app.clone(), a.plugin_id).await)
+        }
+        "plugin_usage_update_prices" => {
+            let a: PluginHostArgs = parse_args(&raw)?;
+            ser(crate::plugin_usage::plugin_usage_update_prices(app.clone(), a.plugin_id).await)
+        }
+        "plugin_limits_get" => {
+            let a: PluginLimitsArgs = parse_args(&raw)?;
+            ser(crate::plugin_usage::plugin_limits_get(a.plugin_id, a.providers, a.refresh).await)
+        }
+        // NB: cli_credential_consent_* / cli_credential_sources are
+        // intentionally absent — only the desktop user may allow reading
+        // local CLI logins (src-tauri/src/usage_limits/consent.rs).
         "save_pasted_image" => {
             let a: SavePastedImageArgs = parse_args(&raw)?;
             ser(crate::engine::images::save_pasted_image(
@@ -797,7 +917,17 @@ pub(super) async fn dispatch(
         // The web bridge has no OS pasteboard to read (and browsers expose no
         // file path to page JavaScript): pasted files stay limited to the
         // flavors the paste event itself carried.
-        "clipboard_file_paths" => ser(Ok::<Vec<String>, String>(Vec::new())),
+        "clipboard_file_snapshot" => ser(Ok::<crate::clipboard::ClipboardFileSnapshot, String>(
+            crate::clipboard::ClipboardFileSnapshot {
+                paths: Vec::new(),
+                change_count: None,
+            },
+        )),
+        // No generation either: the tree then always pastes its own item.
+        "clipboard_change_count" => ser(Ok::<Option<u64>, String>(None)),
+        // Same reason: nothing to write. The tab keeps the in-app tree
+        // clipboard, so Copy/Paste inside the tree still works.
+        "clipboard_set_file_paths" => ser(Ok::<(), String>(())),
         // history
         "list_sessions" => ser(crate::history::reader::list_sessions(app.state()).await),
         "list_archived_sessions" => {
@@ -820,27 +950,6 @@ pub(super) async fn dispatch(
             )
             .await)
         }
-        // Usage ledger: the mobile/web client renders the same page, so the
-        // bridge must route it like every other settings surface.
-        "usage_summary" => {
-            let a: UsageSummaryArgs = parse_args(&raw)?;
-            ser(crate::usage::usage_summary(
-                app.state(),
-                a.days,
-                a.tz_offset_minutes,
-            )
-            .await)
-        }
-        "usage_record" => {
-            let a: UsageRecordArgs = parse_args(&raw)?;
-            ser(crate::usage::usage_record(
-                app.clone(),
-                app.state(),
-                a.entry,
-            )
-            .await)
-        }
-        "usage_clear" => ser(crate::usage::usage_clear(app.state()).await),
         "load_session_page" => {
             let a: LoadSessionPageArgs = parse_args(&raw)?;
             ser(crate::history::reader::load_session_page(
@@ -849,6 +958,7 @@ pub(super) async fn dispatch(
                 a.session_id,
                 a.limit,
                 a.before_seq,
+                a.force_reload,
             )
             .await)
         }
@@ -862,8 +972,21 @@ pub(super) async fn dispatch(
                 a.remote_path,
                 a.limit,
                 a.before_seq,
+                a.force_reload,
             )
             .await)
+        }
+        "read_session_file" => {
+            let a: SessionFileArgs = parse_args(&raw)?;
+            ser(crate::history::edit::read_session_file(app.state(), a.engine, a.session_id, a.workspace_path, a.remote_path).await)
+        }
+        "write_session_file" => {
+            let a: WriteSessionFileArgs = parse_args(&raw)?;
+            ser(crate::history::edit::write_session_file(app.state(), a.engine, a.session_id, a.content, a.expected_version, a.workspace_path, a.remote_path).await)
+        }
+        "open_session_file_in_default_editor" => {
+            let a: EngineSessionArgs = parse_args(&raw)?;
+            ser(crate::history::edit::open_session_file_in_default_editor(app.state(), a.engine, a.session_id).await)
         }
         "delete_session" => {
             let a: EngineSessionArgs = parse_args(&raw)?;
@@ -897,6 +1020,16 @@ pub(super) async fn dispatch(
                 a.engine,
                 a.session_id,
                 a.title,
+            )
+            .await)
+        }
+        "fork_session" => {
+            let a: ForkSessionArgs = parse_args(&raw)?;
+            ser(crate::engine::fork::fork_session(
+                app.state(),
+                a.engine,
+                a.session_id,
+                a.at,
             )
             .await)
         }
@@ -983,6 +1116,15 @@ pub(super) async fn dispatch(
             )
             .await)
         }
+        "set_workspace_pinned" => {
+            let a: SetWorkspacePinnedArgs = parse_args(&raw)?;
+            ser(crate::history::reader::set_workspace_pinned(
+                app.state(),
+                a.id,
+                a.pinned,
+            )
+            .await)
+        }
         "remove_workspace" => {
             let a: IdArgs = parse_args(&raw)?;
             ser(crate::history::reader::remove_workspace(app.state(), a.id).await)
@@ -1003,11 +1145,21 @@ pub(super) async fn dispatch(
         }
         "read_file" => {
             let a: PathArgs = parse_args(&raw)?;
-            ser(crate::files::read_file(app.state(), a.path).await)
+            ser(crate::files::read_file(app.state(), a.path, a.encoding).await)
         }
         "write_file" => {
             let a: WriteFileArgs = parse_args(&raw)?;
-            ser(crate::files::write_file(app.state(), a.path, a.content).await)
+            ser(
+                crate::files::write_file(
+                    app.state(),
+                    a.path,
+                    a.content,
+                    a.encoding,
+                    a.bom,
+                    a.line_ending,
+                )
+                .await,
+            )
         }
         "create_dir" => {
             let a: PathArgs = parse_args(&raw)?;
@@ -1038,6 +1190,15 @@ pub(super) async fn dispatch(
             )
             .await)
         }
+        // The clipboard is the client machine's, not the host's: a LAN
+        // browser tab has no file paths to hand over, so paste reports an
+        // empty file list and the tree falls back to its own clipboard.
+        "paste_clipboard_items" => ser(Ok::<crate::files::PasteClipboardResult, String>(
+            crate::files::PasteClipboardResult {
+                created: Vec::new(),
+                failed: Vec::new(),
+            },
+        )),
         "search_text" => {
             let a: SearchTextArgs = parse_args(&raw)?;
             ser(crate::files::search_text(app.state(), a.path, a.query).await)
@@ -1215,6 +1376,10 @@ pub(super) async fn dispatch(
             let a: GitDiffArgs = parse_args(&raw)?;
             ser(crate::git::git_diff(a.path, a.file, a.staged).await)
         }
+        "git_diff_images" => {
+            let a: GitDiffArgs = parse_args(&raw)?;
+            ser(crate::git::git_diff_images(a.path, a.file, a.staged).await)
+        }
         "git_stage" => {
             let a: GitFilesArgs = parse_args(&raw)?;
             ser(crate::git::git_stage(a.path, a.files).await)
@@ -1306,36 +1471,13 @@ pub(super) async fn dispatch(
                 app.state(),
             ))
         }
-        // web access: phones may read status; start/stop stay desktop-only.
+        // web access: phones may read status. Starting, stopping and pointing
+        // the bridge or relay, unattended autostart, worker deploys and device
+        // approval are refused before this match (desktop_only_refusal).
         "web_access_status" => ser(Ok(web_access_status(app.clone()))),
-        // The relay has no bootstrap problem (unlike the bridge, which cannot
-        // start itself over itself), so an approved device may manage it too.
         "web_relay_status" => ser(Ok(crate::relay::web_relay_status(app.clone()))),
-        "web_relay_start" => {
-            let a: RelayArgs = parse_args(&raw)?;
-            ser(crate::relay::web_relay_start(app.clone(), a.url, a.key).await)
-        }
-        "web_relay_stop" => ser(crate::relay::web_relay_stop(app.clone())),
-        "web_relay_unattended" => {
-            let a: RelayUnattendedArgs = parse_args(&raw)?;
-            ser(crate::relay::web_relay_unattended_set(app.clone(), a.enabled))
-        }
-        "relay_deploy_pack" => {
-            let a: RelayDeployPackArgs = parse_args(&raw)?;
-            ser(crate::relay::relay_deploy_pack(a.path, a.key))
-        }
-        "relay_deploy" => {
-            let a: RelayDeployArgs = parse_args(&raw)?;
-            ser(crate::relay::relay_deploy(a.token, a.account_id).await)
-        }
-        // Device approval is the one management action a phone may take: it
-        // is already device-scoped, and the desktop page would otherwise be
-        // the only way to approve a browser the user is holding.
         "web_devices" => ser(web_devices(app.clone())),
-        "web_device_approve" => {
-            let a: DeviceIdArgs = parse_args(&raw)?;
-            ser(web_device_approve(app.clone(), a.id).await)
-        }
+        // Revoking only narrows access, so a phone may still do it.
         "web_device_revoke" => {
             let a: DeviceIdArgs = parse_args(&raw)?;
             ser(web_device_revoke(app.clone(), a.id).await)
@@ -1412,5 +1554,74 @@ pub(super) async fn dispatch(
         }
         "plugin_check_updates" => ser(crate::plugins::market::plugin_check_updates().await),
         _ => Err(format!("unknown command: {cmd}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn remote_access_management_is_refused_with_a_desktop_only_error() {
+        for cmd in [
+            "web_relay_start",
+            "web_relay_stop",
+            "web_relay_unattended",
+            "web_relay_unattended_set",
+            "relay_deploy_pack",
+            "relay_deploy",
+            "web_device_approve",
+        ] {
+            let error = desktop_only_refusal(cmd).unwrap_or_else(|| panic!("{cmd} must be refused"));
+            assert!(error.starts_with(DESKTOP_ONLY_PREFIX), "{error}");
+        }
+        // Reading status and revoking a device stay available to phones.
+        for cmd in ["web_relay_status", "web_devices", "web_device_revoke", "send_message"] {
+            assert!(desktop_only_refusal(cmd).is_none(), "{cmd}");
+        }
+    }
+
+    #[test]
+    fn remote_settings_updates_keep_the_desktop_owned_fields() {
+        let mut current = crate::settings::AppSettings::default();
+        current.web_auth_enabled = true;
+        current.web_auth_key = Some("desktop-key".into());
+        current.web_relay_url = Some("https://relay.example".into());
+        current.web_relay_key = Some("relay-secret".into());
+        current.web_relay_unattended = Some(false);
+        current.web_access_auto_start = Some(false);
+        current.web_access_port = Some(8765);
+        current.web_access_token = Some("lan-token".into());
+        current.analytics_enabled = Some(false);
+
+        let mut incoming = crate::settings::AppSettings::default();
+        incoming.language = "en".into();
+        incoming.web_auth_enabled = false;
+        incoming.web_auth_key = None;
+        incoming.web_relay_url = Some("https://attacker.example".into());
+        incoming.web_relay_key = Some("attacker".into());
+        incoming.web_relay_unattended = Some(true);
+        incoming.web_access_auto_start = Some(true);
+        incoming.web_access_port = Some(1);
+        incoming.web_access_token = Some("attacker".into());
+        incoming.analytics_enabled = Some(true);
+
+        let merged = keep_desktop_owned_settings(incoming, &current);
+        assert_eq!(merged.language, "en", "ordinary fields still follow the client");
+        assert!(merged.web_auth_enabled);
+        assert_eq!(merged.web_auth_key.as_deref(), Some("desktop-key"));
+        assert_eq!(merged.web_relay_url.as_deref(), Some("https://relay.example"));
+        assert_eq!(merged.web_relay_key.as_deref(), Some("relay-secret"));
+        assert_eq!(merged.web_relay_unattended, Some(false));
+        assert_eq!(merged.web_access_auto_start, Some(false));
+        assert_eq!(merged.web_access_port, Some(8765));
+        assert_eq!(merged.web_access_token.as_deref(), Some("lan-token"));
+        assert_eq!(merged.analytics_enabled, Some(false));
+    }
+
+    #[test]
+    fn remote_sends_never_mount_the_computer_use_driver() {
+        assert_eq!(remote_computer_use(Some(true)), None);
+        assert_eq!(remote_computer_use(None), None);
     }
 }

@@ -74,10 +74,15 @@ export interface TodoItem {
   detail?: string | null;
 }
 
+/** One entry of a todo payload. A patch entry may leave `status` out: the
+ *  update did not set one (a TaskUpdate that only renames), so the item
+ *  keeps its current status. */
+export type TodoPayloadItem = Omit<TodoItem, "status"> & { status?: TodoStatus };
+
 /** Todo-list payload on todo-class tool rows: replace = full snapshot,
- * otherwise a patch matched by content (status "dropped" removes). */
+ * otherwise a patch matched by id, then content (status "dropped" removes). */
 export interface TodosPayload {
-  items: TodoItem[];
+  items: TodoPayloadItem[];
   replace: boolean;
 }
 
@@ -90,6 +95,8 @@ export interface QuestionSpec {
   options: { label: string; description?: string; preview?: string }[];
 }
 
+export const AGENT_STATUS_ROLE = "__agent_status__";
+
 export interface Message {
   seq: number;
   role: string; // "user" | "assistant" | "tool" | "thinking"
@@ -100,6 +107,11 @@ export interface Message {
   args?: unknown;
   /** Tool execution result/output; shown in the tool panel. */
   result?: unknown;
+  /** The engine's id for this tool call, when it reported one. Runtime-only:
+   *  a live result patch pairs to its call on this, so parallel calls of one
+   *  tool (four `TaskCreate` in a batch) each settle their own row. History
+   *  rows do not carry it — the backend pairs results by id while folding. */
+  toolCallId?: string;
   todos?: TodosPayload;
   ts: string | null;
   usage?: unknown;
@@ -116,6 +128,7 @@ export interface Message {
       comparisonModel?: string | null;
     };
     served: { model: string | null; effort: string | null };
+    reportsServed?: boolean;
   } | null;
   /** Turn duration in milliseconds (measured from prompt send to turn completion) */
   durationMs?: number | null;
@@ -123,11 +136,14 @@ export interface Message {
   live?: boolean;
   /** Permission-denial card state (role "grant"): the CLI denied a tool call
    * targeting `path`; pending until the user answers the card. `dir` is the
-   * directory a grant would cover (grant_scope preview). Grant rows are
-   * ephemeral UI — they are not part of the CLI's session history. */
+   * directory a grant would cover (grant_scope preview). `toolUseId` is the
+   * denied call, which matches a denial's mid-turn and result-line copies.
+   * Grant rows are ephemeral UI — they are not part of the CLI's session
+   * history. */
   grant?: {
     status: "pending" | "granted" | "declined";
     dir?: string | null;
+    toolUseId?: string | null;
   };
   /** AskUserQuestion card state (role "question"): the CLI parked the ask on
    * the control protocol; `pending` until the user picks or skips. `runId`
@@ -152,12 +168,21 @@ export interface SessionPage {
   subagentHistory: Message[];
 }
 
+/** Complete native source, or an editable native-record view for database CLIs. */
+export interface SessionFileDocument {
+  path: string;
+  name: string;
+  text: string;
+  version: string;
+}
+
 export interface Workspace {
   id: string;
   path: string;
   name: string;
   lastOpenedAt: number | null;
   sortOrder: number | null;
+  pinned?: boolean;
   /** Sidebar group id (工作区分组); null = ungrouped. */
   groupId: string | null;
   /** "worktree" = git worktree child under its parent workspace row;
@@ -405,9 +430,81 @@ export interface EngineCatalog {
   remote?: boolean;
 }
 
+/** Retry cause as the host classified the CLI's own wording
+ *  (src-tauri/src/engine/activity.rs `classify_retry`). */
+export type RetryCategory =
+  | "network"
+  | "rate_limit"
+  | "overloaded"
+  | "server"
+  | "auth"
+  | "client"
+  | "unknown";
+
+export interface RunToolActivity {
+  id?: string;
+  name: string;
+  sinceMs: number;
+  detail?: string;
+}
+
+export interface RunRetryActivity {
+  atMs: number;
+  attempt: number;
+  max: number;
+  status?: number;
+  category: RetryCategory;
+  message: string;
+}
+
+export interface RunActivitySnapshot {
+  runId: string;
+  engine: string;
+  pid?: number;
+  startedAtMs: number;
+  lastOutputAtMs?: number;
+  lastEventAtMs?: number;
+  lastEvent?: string;
+  responseSinceMs?: number;
+  responseHasOutput: boolean;
+  block?: "thinking" | "text" | "tool_input" | "other";
+  blockSinceMs?: number;
+  tools: RunToolActivity[];
+  retries: RunRetryActivity[];
+  retrying: boolean;
+  compactingSinceMs?: number;
+  awaitingUser: boolean;
+  backgroundTasks: number;
+  lastWarn?: string;
+  lastWarnAtMs?: number;
+  nowMs: number;
+}
+
 export interface SendResult {
   runId: string;
   sessionId: string | null;
+}
+
+/** 会话分叉：`fork_session` 的返回。命令返回时分叉会话**已经落盘**（前缀转录本
+ *  写好 + `sessions` 行登记完成），前端直接按 `targetSessionId` 打开即可。 */
+export interface ForkPlan {
+  sourceSessionId: string;
+  sourceEngine: string;
+  /** 为分支分配的新会话 id（UUIDv4）。 */
+  targetSessionId: string;
+  /** 分叉点是否在来源末尾（完整轮次边界）。 */
+  atTip: boolean;
+  /** 分支保留的源记录条数（`usize::MAX` = 保留整个文件）。 */
+  keepRecords?: number;
+  sourceTitle: string;
+  /** 来源会话所属工作区。分支的 `sessions` 行是**按这个**写的，所以页签也必须
+   *  用它打开：否则两者不一致时，分支首轮会以别的工作区为 cwd 启动，
+   *  而引擎按 cwd 解析转录本，`--resume` 可能找不到分支文件。
+   *  可选是为了兼容旧后端（缺省时回退到调用方工作区）。 */
+  workspacePath?: string;
+  /** 已降级、但分支仍算成功的项：`model` / `effort` / `provider`。
+   *  缺省或空数组表示全部继承成功。后端返回的是**稳定代码**，文案由前端 i18n 拼。 */
+  degraded?: string[];
 }
 
 export interface ProviderSection {
@@ -436,13 +533,6 @@ export interface ProviderModelList {
   models: string[];
   endpoint: string;
 }
-export interface CodeBuddyAccountStatus {
-  loggedIn: boolean;
-  /** "found" = credential store probe hit; "unknown" = the guessed service
-   *  names missed, which is not proof of being logged out. */
-  detection: "found" | "unknown";
-}
-
 
 export interface WorkspaceGroup {
   id: string;
@@ -478,6 +568,7 @@ export interface AppSettings {
   workspaceGroups: WorkspaceGroup[];
   /** Workspace id -> sidebar display alias; absent = show the folder name. */
   workspaceAliases: Record<string, string>;
+  workspaceDefaultEngines?: Record<string, string>;
   /** Ids of workspaces hidden into the sidebar's collapsible 已归档 section. */
   archivedWorkspaces: string[];
   language: string;
@@ -542,8 +633,21 @@ export interface AppSettings {
   /** Thinking-process row behavior once its thinking settles: true/absent =
    *  auto-fold (default), false = stay expanded until the user folds it. */
   thinkingAutoCollapse?: boolean | null;
+  /** System notifications master switch (设置 → 通用 → 行为 → 系统通知): true/absent = enabled (default). */
+  notificationsEnabled?: boolean | null;
+  notificationSoundEnabled?: boolean | null;
+  /** Notify when conversation turn completes: true/absent = enabled (default). */
+  notifyOnCompletion?: boolean | null;
+  /** Notify on interactive questions/permission/plan review: true/absent = enabled (default). */
+  notifyOnQuestion?: boolean | null;
+  /** Notify when conversation turn is interrupted: true/absent = enabled (default). */
+  notifyOnInterrupted?: boolean | null;
+  /** Notify when conversation encounters an error: true/absent = enabled (default). */
+  notifyOnError?: boolean | null;
+  /** Only notify when app window/session is unfocused/background: true/absent = true (default). */
+  notifyWhenUnfocusedOnly?: boolean | null;
   /** 宽幕布 (设置 → 通用 → 外观): true = the chat content column fills its
-   *  pane instead of the default centered column (750px / `max-w-3xl`). */
+   *  pane instead of the centered column (750px / 48rem by default). */
   chatWideLayout?: boolean | null;
   /** File tree entries Git ignores (设置 → 通用 → 行为): absent/false = listed
    *  and drawn faded, true = hidden from the tree. */
@@ -589,6 +693,9 @@ export interface AppSettings {
   webAccessPort?: number | null;
   /** LAN web access fixed auth token (null = auto generate & persist). */
   webAccessToken?: string | null;
+  /** 设置 → 关于 → 使用统计 (null = on). Written only by
+   *  `analyticsEnabledSet`; a full-object update leaving it unset keeps it. */
+  analyticsEnabled?: boolean | null;
 }
 
 export interface DirEntry {
@@ -607,6 +714,10 @@ export interface FileContent {
   text: string | null;
   dataUrl: string | null;
   truncated: boolean;
+  encoding?: "utf-8" | "gbk" | null;
+  bom?: boolean;
+  decodeError?: boolean;
+  lineEnding?: "lf" | "crlf" | "cr" | null;
   /** Served by a remote reader (e.g. WSL distro, features/files/remote-files):
    *  content is complete but writes are unsupported, so the editor stays
    *  read-only — distinct from `truncated`, which means partial content. */
@@ -616,6 +727,20 @@ export interface FileContent {
 export interface FileOpResult {
   path: string;
   isDir: boolean;
+}
+
+/** Result of `paste_clipboard_items`: what the OS clipboard's file list
+ *  produced, plus the reason each rejected item stayed behind. */
+export interface PasteClipboardResult {
+  created: FileOpResult[];
+  failed: string[];
+}
+
+/** Host-read OS file clipboard, including its native generation counter.
+ *  The counter is null where no native file clipboard bridge exists. */
+export interface ClipboardFileSnapshot {
+  paths: string[];
+  changeCount: number | null;
 }
 
 export interface SearchHit {
@@ -982,6 +1107,13 @@ export interface GitStatus {
   untracked: GitFileEntry[];
 }
 
+/** Both sides of an image change as data URLs; a null side means the file
+ *  does not exist in that revision (added / deleted). */
+export interface GitImageDiff {
+  old: string | null;
+  new: string | null;
+}
+
 /** Compact status for a directory that is itself a Git worktree root. */
 export interface RepositorySummary {
   path: string;
@@ -1070,36 +1202,6 @@ export interface WebAccessInfo {
   availableIps?: LanIpEntry[];
 }
 
-/** One finished turn as it enters the usage ledger. */
-export interface UsageEntryInput {
-  /** Epoch ms when the turn settled. */
-  ts: number;
-  engine: string;
-  model: string | null;
-  sessionId: string | null;
-  workspacePath: string | null;
-  input: number;
-  output: number;
-  cacheRead: number;
-  cacheWrite: number;
-  durationMs: number | null;
-  /** Model responses this turn reported (>= 1). */
-  reports: number;
-}
-
-/** Ledger totals for one (local day, engine, model) bucket. */
-export interface UsageRow {
-  /** Local "YYYY-MM-DD". */
-  day: string;
-  engine: string;
-  model: string;
-  input: number;
-  output: number;
-  cacheRead: number;
-  cacheWrite: number;
-  /** Model responses in this bucket — the request total. */
-  requests: number;
-}
 // ---- DeepSeek Harness local host ----
 
 /** Snapshot of the DSH local host + CLI probe (`dsh_host_status`,
@@ -1148,6 +1250,9 @@ export interface CliUpdatePlan {
   command: string[];
   /** Copy-paste fallback for a manual run. */
   manualCommand: string;
+  /** Official installer scripts run in the built-in terminal: the exact line
+   *  to type there (completion marker included). Null for in-app npm runs. */
+  terminalCommand: string | null;
   canRun: boolean;
   blockers: string[];
   platform: string;
@@ -1409,9 +1514,6 @@ export const ipc = {
     invoke<PiFamilyModelsConfigReadResult>("pi_family_models_config_read", { engine }),
   piFamilyModelsConfigWrite: (engine: string, text: string) =>
     invoke<void>("pi_family_models_config_write", { engine, text }),
-  // codebuddy account status
-  codebuddyAccountStatus: (force = false) =>
-    invoke<CodeBuddyAccountStatus>("codebuddy_account_status", { force }),
   // cc-switch interop
   checkCcSwitch: () => invoke<CcSwitchStatus>("check_cc_switch"),
   dismissCcSwitch: (hash: string) => invoke<void>("dismiss_cc_switch", { hash }),
@@ -1430,6 +1532,11 @@ export const ipc = {
   refreshAppSettings: () => {
     settingsPromise = null;
     return fetchAppSettings();
+  },
+  setWorkspaceDefaultEngine: async (workspaceId: string, engine: string) => {
+    const engines = await invoke<Record<string, string>>("set_workspace_default_engine", { workspaceId, engine });
+    settingsPromise = null;
+    return engines;
   },
   updateAppSettings: async (settings: AppSettings) => {
     await invoke<void>("update_app_settings", { settings });
@@ -1504,11 +1611,17 @@ export const ipc = {
      *  开启了记忆、引擎支持挂载时传）。 */
     memoryBot?: string | null;
   }) => invoke<SendResult>("send_message", args),
+  closeIdleCodeBuddy: (sessionId: string) =>
+    invoke<void>("close_idle_codebuddy", { sessionId }),
   interruptSession: (sessionId: string) =>
     invoke<boolean>("interrupt_session", { sessionId }),
   /** Which of these run ids the host still runs: the orphan sweep asks
    *  before settling a run that has gone silent. */
   liveRuns: (runIds: string[]) => invoke<string[]>("live_runs", { runIds }),
+  /** Live activity facts for these runs (run-status panel; polled only while
+   *  the panel is open). Runs the host no longer tracks are absent. */
+  runActivity: (runIds: string[]) =>
+    invoke<RunActivitySnapshot[]>("run_activity", { runIds }),
   // 电脑操控 (computer use)
   /** macOS TCC probe. `osPermissionsRequired` is false on Windows/Linux,
    *  where the driver needs no OS grant. */
@@ -1536,6 +1649,19 @@ export const ipc = {
   }) => invoke<SendResult>("mission_agent_start", args),
   missionAgentInterrupt: (runId: string) =>
     invoke<boolean>("mission_agent_interrupt", { runId }),
+  /** 插件介绍翻译：零工具纯文本轮次，跑在应用目录下的空沙盒里（后端
+   *  translate.rs）。事件走 mission-agent://event，按 runId 路由。 */
+  translateTextStart: (args: {
+    /** 前端预生成的 runId（translate- 前缀）；先注册监听再 invoke。 */
+    runId: string;
+    engine: string;
+    prompt: string;
+    model: string | null;
+    effort: string | null;
+    providerId: string | null;
+  }) => invoke<SendResult>("translate_text_start", args),
+  translateTextInterrupt: (runId: string) =>
+    invoke<boolean>("translate_text_interrupt", { runId }),
   listEngines: () => invoke<EngineInfo[]>("list_engines"),
   /** Record a complete internal frame already accepted by its live capture
    * validator, so history reload can hide only that exact frame.
@@ -1573,10 +1699,19 @@ export const ipc = {
    * new paths (same order). Picked paths live outside the sandbox, so the
    * engines' path-based image pipeline cannot read them in place. */
   importAttachments: (paths: string[]) => invoke<string[]>("import_attachments", { paths }),
-  /** Absolute paths of the files on the OS clipboard (Finder / Explorer
-   * copies expose no path to the webview). Empty when the clipboard holds no
-   * file; the web bridge has no OS pasteboard and always answers empty. */
-  clipboardFilePaths: () => invoke<string[]>("clipboard_file_paths"),
+  /** Host-read OS clipboard snapshot (Finder / Explorer file copies expose
+   *  no path to the webview). Rejects on a real read failure; the web bridge
+   *  has no OS pasteboard and returns an empty snapshot with no generation. */
+  clipboardFileSnapshot: () => invoke<ClipboardFileSnapshot>("clipboard_file_snapshot"),
+  /** The OS clipboard generation alone. Unlike a snapshot it never opens the
+   *  clipboard, so it answers while another program holds it; null where no
+   *  native generation exists (Linux, the web bridge). */
+  clipboardChangeCount: () => invoke<number | null>("clipboard_change_count"),
+  /** Replace the OS clipboard with a file list, so Finder / Explorer paste
+   *  the actual items. Rejects when the host cannot write; the in-app tree
+   *  clipboard still carries the item (Linux has no native bridge). */
+  setClipboardFilePaths: (paths: string[]) =>
+    invoke<void>("clipboard_set_file_paths", { paths }),
   listEngineModels: (engine: string, workspace?: string) =>
     withGrantRetry(() =>
       invoke<EngineCatalog>("list_engine_models", { engine, workspace: workspace ?? null }),
@@ -1588,12 +1723,19 @@ export const ipc = {
     invoke<void>("archive_session", { session }),
   restoreSession: (engine: string, sessionId: string) =>
     invoke<void>("restore_session", { engine, sessionId }),
+  readSessionFile: (engine: string, sessionId: string, workspacePath?: string, remotePath?: string) =>
+    invoke<SessionFileDocument>("read_session_file", { engine, sessionId, workspacePath, remotePath }),
+  writeSessionFile: (engine: string, sessionId: string, content: string, expectedVersion: string, workspacePath?: string, remotePath?: string) =>
+    invoke<SessionFileDocument>("write_session_file", { engine, sessionId, content, expectedVersion, workspacePath, remotePath }),
+  openSessionFileInDefaultEditor: (engine: string, sessionId: string) =>
+    invoke<void>("open_session_file_in_default_editor", { engine, sessionId }),
   loadSessionPage: (
     engine: string,
     sessionId: string,
     limit?: number,
     beforeSeq?: number | null,
-  ) => invoke<SessionPage>("load_session_page", { engine, sessionId, limit, beforeSeq }),
+    forceReload?: boolean,
+  ) => invoke<SessionPage>("load_session_page", { engine, sessionId, limit, beforeSeq, forceReload }),
   /** Full-text search over message bodies (⌘L palette). FTS5 trigram when
    *  every token is ≥3 chars, exact AND-substring LIKE otherwise. */
   searchMessages: (
@@ -1611,6 +1753,7 @@ export const ipc = {
     remotePath: string,
     limit?: number,
     beforeSeq?: number | null,
+    forceReload?: boolean,
   ) =>
     invoke<SessionPage>("load_remote_session_page", {
       workspacePath,
@@ -1619,6 +1762,7 @@ export const ipc = {
       remotePath,
       limit,
       beforeSeq,
+      forceReload,
     }),
   deleteSession: (engine: string, sessionId: string) =>
     invoke<void>("delete_session", { engine, sessionId }),
@@ -1638,6 +1782,21 @@ export const ipc = {
     invoke<void>("pin_session", { engine, sessionId, pinned }),
   renameSession: (engine: string, sessionId: string, title: string) =>
     invoke<void>("rename_session", { engine, sessionId, title }),
+  /** 会话分叉：**点击即落盘**——后端在这一步就把裁剪后的前缀写成分支转录本并
+   *  登记 `sessions` 行，返回的 `ForkPlan` 带着新会话 id（见 `engine/fork/mod.rs` 与
+   *  `docs/design/session-fork-conversation.zh-CN.md` §2.3）。
+   *  分支之后的每条消息都只是**普通续接**，发送路径上没有分叉字段。
+   *  `anchor` 省略即 tip 分叉（完整轮次末尾）。 */
+  forkSession: (
+    engine: string,
+    sessionId: string,
+    anchor?: { userTextSha256: string; seqHint?: number; tailOccurrence?: number } | null,
+  ) =>
+    invoke<ForkPlan>("fork_session", {
+      engine,
+      sessionId,
+      at: anchor ?? null,
+    }),
   /** Remember the model id this session ran ("provider/model", as the picker
    * spells it) — the engine's own transcript keeps only the bare name, so
    * this is what survives a restart or another client. */
@@ -1675,6 +1834,7 @@ export const ipc = {
   pluginAddWorkspace: (pluginId: string, path: string, meta?: Record<string, unknown>) =>
     invoke<Workspace>("plugin_add_workspace", { pluginId, path, meta: meta ?? null }),
   reorderWorkspaces: (ids: string[]) => invoke<void>("reorder_workspaces", { ids }),
+  setWorkspacePinned: (id: string, pinned: boolean) => invoke<void>("set_workspace_pinned", { id, pinned }),
   removeWorkspace: (id: string) => invoke<void>("remove_workspace", { id }),
   setWorkspaceGroup: (id: string, groupId: string | null) =>
     invoke<void>("set_workspace_group", { id, groupId }),
@@ -1697,9 +1857,22 @@ export const ipc = {
     withGrantRetry(() =>
       invoke<DirEntry[]>("list_dir", { path, gitIgnoreRoot: opts?.gitIgnoreRoot }),
     ),
-  readFile: (path: string) => withGrantRetry(() => invoke<FileContent>("read_file", { path })),
-  writeFile: (path: string, content: string) =>
-    withGrantRetry(() => invoke<void>("write_file", { path, content })),
+  readFile: (path: string, encoding?: "utf-8" | "gbk") =>
+    withGrantRetry(() => invoke<FileContent>("read_file", { path, encoding: encoding ?? null })),
+  writeFile: (
+    path: string,
+    content: string,
+    encoding?: "utf-8" | "gbk",
+    bom?: boolean,
+    lineEnding?: "lf" | "crlf" | "cr",
+  ) =>
+    withGrantRetry(() => invoke<void>("write_file", {
+      path,
+      content,
+      encoding: encoding ?? null,
+      bom: bom ?? false,
+      lineEnding: lineEnding ?? null,
+    })),
   createDir: (path: string) => withGrantRetry(() => invoke<void>("create_dir", { path })),
   /** Fails when the file already exists (unlike write_file, which overwrites). */
   createFile: (path: string) => withGrantRetry(() => invoke<void>("create_file", { path })),
@@ -1710,6 +1883,13 @@ export const ipc = {
     withGrantRetry(() => invoke<FileOpResult>("duplicate_item", { path })),
   pasteItem: (source: string, targetDir: string) =>
     withGrantRetry(() => invoke<FileOpResult>("paste_item", { source, targetDir })),
+  /** Copy whatever file list the OS clipboard holds into `targetDir`. The
+   *  host reads the clipboard itself — source paths never come over IPC —
+   *  and the web bridge answers with an empty list. */
+  pasteClipboardItems: (targetDir: string) =>
+    withGrantRetry(() =>
+      invoke<PasteClipboardResult>("paste_clipboard_items", { targetDir }),
+    ),
   searchText: (path: string, query: string) =>
     withGrantRetry(() => invoke<SearchHit[]>("search_text", { path, query })),
   /** Whole-tree file index for the composer @-mention picker (relative
@@ -1850,6 +2030,9 @@ export const ipc = {
     invoke<GitTreeStatus>("git_tree_status", { levels }),
   gitDiff: (path: string, file: string, staged: boolean) =>
     invoke<string>("git_diff", { path, file, staged }),
+  /** Image files diff as bytes, not patch text. */
+  gitDiffImages: (path: string, file: string, staged: boolean) =>
+    invoke<GitImageDiff>("git_diff_images", { path, file, staged }),
   gitStage: (path: string, files: string[]) => invoke<void>("git_stage", { path, files }),
   gitUnstage: (path: string, files: string[]) =>
     invoke<void>("git_unstage", { path, files }),
@@ -2010,6 +2193,9 @@ export const ipc = {
    *  Codex / ~/.agents）。插件中心的「创建插件」在开新会话前调一次，这样
    *  `/ccgui-plugin-creator` 在引擎侧确实存在、可被解析。 */
   creatorSkillInstall: () => invoke<CreatorSkillReport>("creator_skill_install"),
+  // usage analytics: the backend sends one page view per launch (desktop-only switch)
+  analyticsEnabledGet: () => invoke<boolean>("analytics_enabled_get"),
+  analyticsEnabledSet: (enabled: boolean) => invoke<void>("analytics_enabled_set", { enabled }),
   // web access (start/stop are desktop-only; the bridge answers status too)
   webDevices: () => invoke<WebDevice[]>("web_devices"),
   webDeviceApprove: (id: string) => invoke<boolean>("web_device_approve", { id }),
@@ -2044,11 +2230,6 @@ export const ipc = {
   webAccessStatus: () => invoke<WebAccessInfo | null>("web_access_status"),
   webAccessAvailableIps: () => invoke<LanIpEntry[]>("web_access_available_ips"),
   webAccessRotateToken: () => invoke<string>("web_access_rotate_token"),
-  // usage ledger (settings 用量)
-  usageRecord: (entry: UsageEntryInput) => invokePersisted<void>("usage-ledger", "usage_record", { entry }),
-  usageSummary: (days: number, tzOffsetMinutes: number) =>
-    invoke<UsageRow[]>("usage_summary", { days, tzOffsetMinutes }),
-  usageClear: () => invokePersisted<void>("usage-ledger", "usage_clear"),
   // DeepSeek Harness local host (dsh web --host H --port P)
   dshHostStatus: () => invoke<DshHostStatus>("dsh_host_status"),
   dshHostStart: () => invoke<DshHostStatus>("dsh_host_start"),

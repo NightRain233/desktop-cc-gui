@@ -2,144 +2,73 @@ use super::{
     claude::ClaudeEngine, command_for_binary, images, BuiltCommand, Engine, EngineEvent,
     SendRequest,
 };
-use serde::Serialize;
+use serde_json::{json, Value};
 
-#[derive(Debug, Clone, Serialize, Default)]
-#[serde(rename_all = "camelCase")]
-pub struct CodeBuddyAccountStatus {
-    pub logged_in: bool,
-    /// The probed credential service names are guesses (the CLI's exact
-    /// Keychain/Credential Manager/keyring names are not publicly
-    /// documented), so a negative probe is "unknown", not "logged out".
-    /// Only a positive probe is conclusive.
-    pub detection: &'static str,
-}
+/// CodeBuddy's own "skip these questions" answer: the tool settles with a
+/// non-error "the user chose not to answer, continue" result.
+const SKIP_QUESTION_ACTION: &str = "skip_question";
 
-/// CodeBuddy stores CLI credentials in the OS credential manager per its
-/// official IAM docs (macOS Keychain, Windows Credential Manager, Linux
-/// keyring) — not in plain files under `~/.codebuddy`. Probing guessed
-/// filenames there misreported both directions: a successful terminal
-/// `/login` still showed "not logged in", while a stale/IDE-side file showed
-/// "logged in". Probe the real stores read-only, existence only, and never
-/// read secret values; the result is a bare boolean.
-fn cli_credentials_present() -> bool {
-    #[cfg(target_os = "macos")]
-    {
-        // `security find-generic-password` without `-w` reports existence
-        // only and never prints the secret. The exact service name is not
-        // publicly documented, so probe the plausible candidates.
-        ["codebuddy", "CodeBuddy", "com.tencent.codebuddy"]
-            .iter()
-            .any(|service| {
-                let mut cmd = std::process::Command::new("security");
-                cmd.args(["find-generic-password", "-s", service]);
-                run_probe_command(cmd)
-                    .map(|out| out.status.success())
-                    .unwrap_or(false)
-            })
-    }
-    #[cfg(target_os = "windows")]
-    {
-        // `cmdkey /list` prints target names of stored credentials, never
-        // secrets.
-        let mut cmd = std::process::Command::new("cmdkey");
-        cmd.arg("/list");
-        run_probe_command(cmd)
-            .map(|out| {
-                String::from_utf8_lossy(&out.stdout)
-                    .to_lowercase()
-                    .contains("codebuddy")
-            })
-            .unwrap_or(false)
-    }
-    #[cfg(all(unix, not(target_os = "macos")))]
-    {
-        // `secret-tool search` exits non-zero when nothing matches; without
-        // `--unlock` it prints item attributes only, never the secret.
-        let mut cmd = std::process::Command::new("secret-tool");
-        cmd.args(["search", "service", "codebuddy"]);
-        run_probe_command(cmd)
-            .map(|out| out.status.success())
-            .unwrap_or(false)
-    }
-}
-
-/// Credential-store tools can block indefinitely (locked keyring, missing
-/// session D-Bus, unlock prompt), and the settings page re-probes on every
-/// window focus. Every probe therefore runs under a hard deadline: poll the
-/// child and kill it once the budget is spent, so the IPC call always settles
-/// and blocked probes cannot pile up.
-const ACCOUNT_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1500);
-
-fn run_probe_command(mut cmd: std::process::Command) -> Option<std::process::Output> {
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        // cmdkey is console-subsystem: without this flag every focus-triggered
-        // probe flashes a console window (same fix as engine::hide_console).
-        cmd.creation_flags(CREATE_NO_WINDOW);
-    }
-    cmd.stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null());
-    let mut child = cmd.spawn().ok()?;
-    let deadline = std::time::Instant::now() + ACCOUNT_PROBE_TIMEOUT;
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => return child.wait_with_output().ok(),
-            Ok(None) if std::time::Instant::now() < deadline => {
-                std::thread::sleep(std::time::Duration::from_millis(25));
-            }
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return None;
-            }
+/// Reply to a parked AskUserQuestion `can_use_tool` request in CodeBuddy's
+/// shape, `{allowed, updatedInput}` (a claude-style `behavior: "allow"` reads
+/// as a denial there). Answers are keyed by question text and the CLI's
+/// schema takes string values only, so multi-select picks are joined ", ".
+///
+/// A skip (`None`) is CodeBuddy's native `_action: "skip_question"`, not a
+/// denial: a denial lands in the turn's `permission_denials` (a bogus
+/// permission card) and hands the model an error result. An empty map is a
+/// skip too: allowed with no answers parks the CLI on answers forever.
+pub(super) fn question_response(
+    request_id: &str,
+    context: &Value,
+    answers: Option<Value>,
+) -> Result<Value, String> {
+    let answers = match answers {
+        Some(Value::Object(answers)) if !answers.is_empty() => answer_texts(answers)?,
+        Some(Value::Object(_)) | None => {
+            serde_json::Map::from_iter([("_action".to_string(), json!(SKIP_QUESTION_ACTION))])
         }
-    }
+        Some(_) => return Err("question answers must be an object".to_string()),
+    };
+    let mut input = context["input"].as_object().cloned().unwrap_or_default();
+    input.insert("answers".into(), Value::Object(answers));
+    Ok(json!({
+        "type": "control_response",
+        "response": {
+            "subtype": "success",
+            "request_id": request_id,
+            "response": {
+                "allowed": true,
+                "tool_use_id": context["toolUseId"],
+                "updatedInput": Value::Object(input),
+            },
+        },
+    }))
 }
 
-pub fn check_codebuddy_account_status() -> CodeBuddyAccountStatus {
-    let logged_in = cli_credentials_present();
-    CodeBuddyAccountStatus {
-        logged_in,
-        // The probed service names are guesses: a hit proves "logged in",
-        // a miss only means "not found under the names we tried".
-        detection: if logged_in { "found" } else { "unknown" },
-        ..Default::default()
-    }
+/// Each answer as the single string CodeBuddy's schema accepts. Malformed
+/// values fail before any frame is written, so the card stays answerable.
+fn answer_texts(
+    answers: serde_json::Map<String, Value>,
+) -> Result<serde_json::Map<String, Value>, String> {
+    answers
+        .into_iter()
+        .map(|(question, answer)| {
+            let text = match answer {
+                Value::String(text) => text,
+                Value::Array(labels) => labels
+                    .iter()
+                    .map(|label| label.as_str().ok_or_else(|| malformed_answer(&question)))
+                    .collect::<Result<Vec<_>, _>>()?
+                    .join(", "),
+                _ => return Err(malformed_answer(&question)),
+            };
+            Ok((question, Value::String(text)))
+        })
+        .collect()
 }
 
-/// The settings page re-probes on every window focus, and each probe spawns
-/// up to three credential-store processes. Cache the result briefly: login
-/// state changes on a minutes scale, not a focus-Event scale. An explicit
-/// refresh passes `force`, because the one action that must re-probe (right
-/// after `/login`) would otherwise receive the pre-login cached answer.
-const ACCOUNT_STATUS_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
-
-#[tauri::command]
-pub async fn codebuddy_account_status(
-    force: Option<bool>,
-) -> Result<CodeBuddyAccountStatus, String> {
-    static CACHE: tokio::sync::Mutex<Option<(std::time::Instant, CodeBuddyAccountStatus)>> =
-        tokio::sync::Mutex::const_new(None);
-    // Held across the probe so concurrent focus events share one probe set
-    // (single flight) instead of each spawning the full set after a miss.
-    let mut cache = CACHE.lock().await;
-    if !force.unwrap_or(false) {
-        if let Some((at, status)) = cache.as_ref() {
-            if at.elapsed() < ACCOUNT_STATUS_CACHE_TTL {
-                return Ok(status.clone());
-            }
-        }
-    }
-    // The probes spawn child processes; keep them off the async runtime.
-    let status = tokio::task::spawn_blocking(check_codebuddy_account_status)
-        .await
-        .map_err(|e| format!("codebuddy account probe: {e}"))?;
-    *cache = Some((std::time::Instant::now(), status.clone()));
-    Ok(status)
+fn malformed_answer(question: &str) -> String {
+    format!("answer to \"{question}\" must be a string or a list of strings")
 }
 
 /// Provider-selection env keys a codebuddy channel owns outright once a
@@ -174,7 +103,9 @@ pub(super) fn apply_channel(
     for key in CHANNEL_SETTINGS_ENV_KEYS {
         overlay.insert(key.to_string(), serde_json::Value::String(String::new()));
     }
-    for (key, value) in env {
+    // serde_json keeps insertion order: a HashMap walk would make identical
+    // launches stage different bytes and miss process reuse.
+    for (key, value) in env.iter().collect::<std::collections::BTreeMap<_, _>>() {
         overlay.insert(key.clone(), serde_json::Value::String(value.clone()));
     }
     let mut settings = serde_json::json!({ "env": overlay });
@@ -283,6 +214,20 @@ impl Engine for CodeBuddyEngine {
 
     fn supports_memory(&self) -> bool {
         true
+    }
+
+    /// 同 Claude：私有文件经 `--mcp-config` 交给 CLI（提示词走 stdin，追加在
+    /// 末尾不会被当成位置参数）。
+    fn mount_on_demand(
+        &self,
+        built: &mut BuiltCommand,
+        servers: &[crate::mcp::launch::OnDemandServer],
+        _workspace: &std::path::Path,
+    ) -> Result<(), String> {
+        let path = crate::mcp::launch::stage_claude_config(servers, "codebuddy-staging")?;
+        built.cleanup_files.push(path.clone());
+        built.command.arg("--mcp-config").arg(path);
+        Ok(())
     }
 
     fn supported_permissions(&self) -> &'static [&'static str] {
@@ -478,18 +423,28 @@ impl Engine for CodeBuddyEngine {
             cmd.arg(session_id);
         }
 
-        let stdin_payload = images::claude_stdin_message(&req.prompt, &req.images, &req.workspace)
+        let user_message = images::claude_stdin_message(&req.prompt, &req.images, &req.workspace)
             .map_err(|error| {
-                super::cleanup_staged_files(&cleanup_files);
-                error
-            })?;
+            super::cleanup_staged_files(&cleanup_files);
+            error
+        })?;
+        // CodeBuddy processes the first initialize before the queued user frame.
+        let initialize = json!({
+            "type": "control_request",
+            "request_id": uuid::Uuid::new_v4().to_string(),
+            "request": {
+                "subtype": "initialize",
+                "hasPrompt": true,
+                "capabilities": { "askUserQuestion": true },
+            },
+        });
         Ok(BuiltCommand {
             command: cmd,
-            stdin_payload: Some(stdin_payload),
+            stdin_payload: Some(format!("{initialize}\n{user_message}")),
             keep_stdin_open: true,
             cleanup_files,
             mcp_restore: None,
-            preassigned_session_id: None,
+            preassigned_session_id: req.session_id.clone(),
         })
     }
 
@@ -498,10 +453,188 @@ impl Engine for CodeBuddyEngine {
     }
 }
 
+pub(crate) struct IdleProcess {
+    pub entry: super::registry::ChildEntry,
+    pub signature: [u8; 32],
+    pub resume: Option<tokio::sync::oneshot::Sender<ResumeTurn>>,
+    pub exited: tokio::sync::watch::Receiver<()>,
+    pub parked_at: std::time::Instant,
+}
+
+pub(crate) struct ResumeTurn {
+    pub run_id: String,
+    pub session_id: String,
+    pub payload: String,
+    pub killed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    pub reader_abort: std::sync::Arc<std::sync::OnceLock<tokio::task::AbortHandle>>,
+    pub comparison_model: Option<Option<String>>,
+    pub accept: tokio::sync::oneshot::Sender<()>,
+}
+
+pub(crate) const IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+/// An idle CLI holds about 370 MB, so only the most recently used few stay parked.
+pub(crate) const MAX_IDLE_PROCESSES: usize = 3;
+
+/// Retire the longest-idle parked process when the pool is full. Dropping its
+/// resume sender makes its reader kill the child; entries already being handed
+/// off or retired (resume taken) do not count.
+pub(crate) fn make_room_for_idle(pool: &mut std::collections::HashMap<String, IdleProcess>) {
+    if pool.values().filter(|process| process.resume.is_some()).count() < MAX_IDLE_PROCESSES {
+        return;
+    }
+    if let Some(oldest) = pool
+        .values_mut()
+        .filter(|process| process.resume.is_some())
+        .min_by_key(|process| process.parked_at)
+    {
+        oldest.resume.take();
+    }
+}
+
+fn read_signature_config(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
+    use std::io::{Error, ErrorKind, Read};
+
+    const MAX_CONFIG_BYTES: u64 = 4 * 1024 * 1024;
+    let metadata = std::fs::metadata(path)?;
+    if !metadata.is_file() || metadata.len() > MAX_CONFIG_BYTES {
+        return Err(Error::new(ErrorKind::InvalidData, "unsupported configuration file"));
+    }
+
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // A workspace can replace a regular file with a FIFO after metadata().
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() > MAX_CONFIG_BYTES {
+        return Err(Error::new(ErrorKind::InvalidData, "unsupported configuration file"));
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_CONFIG_BYTES + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_CONFIG_BYTES {
+        return Err(Error::new(ErrorKind::InvalidData, "configuration file exceeds size limit"));
+    }
+    Ok(bytes)
+}
+
+/// Compare launch settings without keeping credentials or temporary paths in the pool.
+pub(crate) fn launch_signature(
+    command: &tokio::process::Command,
+    files: &[std::path::PathBuf],
+) -> Option<[u8; 32]> {
+    use sha2::{Digest, Sha256};
+    let command = command.as_std();
+    let mut digest = Sha256::new();
+    let mut add = |value: &[u8]| {
+        digest.update(value.len().to_le_bytes());
+        digest.update(value);
+    };
+    add(command.get_program().as_encoded_bytes());
+    let workspace = command.get_current_dir()?;
+    add(workspace.as_os_str().as_encoded_bytes());
+    let home = super::engine_home(Some("CODEBUDDY_CONFIG_DIR"), ".codebuddy");
+    for path in [
+        home.join("settings.json"),
+        home.join("mcp.json"),
+        workspace.join(".mcp.json"),
+        workspace.join(".codebuddy/mcp.json"),
+        workspace.join(".codebuddy/settings.json"),
+        workspace.join(".codebuddy/settings.local.json"),
+    ] {
+        add(path.as_os_str().as_encoded_bytes());
+        match read_signature_config(&path) {
+            Ok(bytes) => {
+                add(&[1]);
+                add(&bytes);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => add(&[0]),
+            Err(_) => return None,
+        }
+    }
+    let mut args = command.get_args();
+    while let Some(arg) = args.next() {
+        if arg == "-r" {
+            args.next();
+        } else if files.iter().any(|file| file.as_os_str() == arg) {
+            add(b"staged-file");
+            add(&read_signature_config(std::path::Path::new(arg)).ok()?);
+        } else {
+            add(arg.as_encoded_bytes());
+        }
+    }
+    for (key, value) in command.get_envs() {
+        add(key.as_encoded_bytes());
+        add(&[u8::from(value.is_some())]);
+        if let Some(value) = value {
+            add(value.as_encoded_bytes());
+        }
+    }
+    Some(digest.finalize().into())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[cfg(unix)]
+    #[test]
+    fn codebuddy_signature_skips_fifo_and_oversized_configs() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let scratch = ScratchHome::new("signature-file");
+        let path = scratch.dir.join(".mcp.json");
+        let mut command = tokio::process::Command::new("codebuddy");
+        command.current_dir(&scratch.dir);
+        assert!(super::launch_signature(&command, &[]).is_some());
+
+        let fifo = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: fifo is NUL-terminated and points to the test's private directory.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        assert!(super::launch_signature(&command, &[]).is_none());
+
+        std::fs::remove_file(&path).unwrap();
+        std::fs::File::create(&path).unwrap().set_len(5 * 1024 * 1024).unwrap();
+        assert!(super::launch_signature(&command, &[]).is_none());
+    }
+
+    #[test]
+    fn identical_channel_launches_share_a_reuse_signature() {
+        let scratch = ScratchHome::new("channel-signature");
+        let env: std::collections::HashMap<String, String> = [
+            ("CODEBUDDY_API_KEY", "sk-test"),
+            ("CODEBUDDY_SMALL_FAST_MODEL", "small"),
+            ("HTTPS_PROXY", "http://127.0.0.1:7890"),
+            ("NO_PROXY", "localhost"),
+        ]
+        .into_iter()
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .collect();
+        let signatures: std::collections::HashSet<_> = (0..20)
+            .map(|_| {
+                // A fresh HashMap per launch, like provider_files::channel_env.
+                let env = env.clone().into_iter().collect();
+                let mut built = BuiltCommand {
+                    command: tokio::process::Command::new("codebuddy"),
+                    stdin_payload: None,
+                    keep_stdin_open: true,
+                    cleanup_files: Vec::new(),
+                    mcp_restore: None,
+                    preassigned_session_id: None,
+                };
+                built.command.current_dir(&scratch.dir);
+                apply_channel(&mut built, &env, None, &scratch.dir.join("staging")).unwrap();
+                let signature = launch_signature(&built.command, &built.cleanup_files);
+                crate::engine::cleanup_staged_files(&built.cleanup_files);
+                signature.unwrap()
+            })
+            .collect();
+        assert_eq!(signatures.len(), 1);
+    }
 
     fn sample_req() -> SendRequest {
         SendRequest {
@@ -520,6 +653,20 @@ mod tests {
             computer_use: None,
             memory_bot: None,
             allowed_tools: None,
+            no_tools: false,
+        }
+    }
+
+    /// Endpoint security treats a GUI app enumerating the OS credential store
+    /// as credential discovery (v1.2.0 was flagged for a hidden `cmdkey /list`).
+    /// CodeBuddy's login state stays CLI-owned: this engine never shells out
+    /// to a credential-store tool.
+    #[test]
+    fn never_spawns_credential_store_tools() {
+        let source = include_str!("codebuddy.rs");
+        for tool in ["cmdkey", "security", "/usr/bin/security", "secret-tool"] {
+            let spawn = format!("Command::new(\"{tool}\")");
+            assert!(!source.contains(&spawn), "codebuddy.rs spawns {tool}");
         }
     }
 
@@ -645,6 +792,131 @@ mod tests {
         assert!(debug.contains("high"));
         assert!(debug.contains("-r"));
         assert!(debug.contains("sess-123"));
+    }
+
+    #[test]
+    fn initializes_question_capability_before_sending_prompt() {
+        let engine = CodeBuddyEngine::new();
+        let mut req = sample_req();
+        req.session_id = Some("existing-session".into());
+        let built = engine.build_command(&req, "codebuddy").unwrap();
+        assert!(built.keep_stdin_open);
+        let payload = built.stdin_payload.unwrap();
+        let frames: Vec<Value> = payload
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0]["type"], "control_request");
+        assert!(frames[0]["request_id"]
+            .as_str()
+            .is_some_and(|id| !id.is_empty()));
+        assert_eq!(
+            frames[0]["request"],
+            json!({
+                "subtype": "initialize",
+                "hasPrompt": true,
+                "capabilities": { "askUserQuestion": true },
+            })
+        );
+        assert_eq!(frames[1]["type"], "user");
+        assert_eq!(frames[1]["message"]["content"][0]["text"], req.prompt);
+    }
+
+    #[test]
+    fn question_callback_round_trips_with_codebuddy_response_shape() {
+        let engine = CodeBuddyEngine::new();
+        let input = json!({"questions": [], "metadata": {"source": "test"}});
+        let callback = json!({
+            "type": "control_request",
+            "request_id": "req",
+            "request": {
+                "subtype": "can_use_tool",
+                "tool_name": "AskUserQuestion",
+                "tool_use_id": "tool",
+                "input": input,
+            },
+        });
+        let mut events = Vec::new();
+        engine.parse_line(&callback.to_string(), &mut events);
+        let [EngineEvent::Question {
+            request_id,
+            tool_use_id,
+            input: parsed,
+        }] = events.as_slice()
+        else {
+            panic!("expected a question event");
+        };
+        assert_eq!(parsed, &input);
+        let context = json!({"input": parsed, "toolUseId": tool_use_id});
+        let frame = question_response(
+            request_id,
+            &context,
+            Some(json!({"单选": "甲", "多选": ["乙", "丙"]})),
+        )
+        .unwrap();
+        assert_eq!(frame["type"], "control_response");
+        assert_eq!(frame["response"]["request_id"], "req");
+        assert_eq!(
+            frame["response"]["response"],
+            json!({
+                "allowed": true,
+                "tool_use_id": "tool",
+                "updatedInput": {
+                    "questions": [],
+                    "metadata": {"source": "test"},
+                    "answers": {"单选": "甲", "多选": "乙, 丙"},
+                },
+            }),
+        );
+    }
+
+    /// A skip must not be a denial: CodeBuddy lists denied calls in the
+    /// turn's `permission_denials`, which surfaced as a bogus "permission
+    /// required" card, and the model got an error result. The native skip is
+    /// allowed with `answers._action = "skip_question"`. An empty map is a
+    /// skip too — allowed with no answers parks the CLI on answers forever.
+    #[test]
+    fn skipped_question_uses_codebuddys_native_skip_not_a_denial() {
+        let context = json!({
+            "input": {"questions": [{"question": "Q?"}]},
+            "toolUseId": "tool",
+        });
+        for answers in [None, Some(json!({}))] {
+            let frame = question_response("req", &context, answers).unwrap();
+            assert_eq!(frame["response"]["request_id"], "req");
+            assert_eq!(
+                frame["response"]["response"],
+                json!({
+                    "allowed": true,
+                    "tool_use_id": "tool",
+                    "updatedInput": {
+                        "questions": [{"question": "Q?"}],
+                        "answers": {"_action": "skip_question"},
+                    },
+                }),
+            );
+        }
+    }
+
+    /// Malformed answers fail before a frame is written (the card stays
+    /// answerable) instead of silently degrading into a skip or a dropped
+    /// label.
+    #[test]
+    fn malformed_question_answers_are_rejected() {
+        let context = json!({"input": {"questions": []}, "toolUseId": "tool"});
+        for answers in [
+            json!("甲"),
+            json!(["甲"]),
+            json!({"Q?": 1}),
+            json!({"Q?": ["甲", 2]}),
+            json!({"Q?": null}),
+        ] {
+            assert!(
+                question_response("req", &context, Some(answers.clone())).is_err(),
+                "accepted {answers}"
+            );
+        }
     }
 
     #[test]

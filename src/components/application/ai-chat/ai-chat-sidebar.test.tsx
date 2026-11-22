@@ -2,8 +2,18 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { sessionMenuRegistry, workspaceMenuRegistry } from "@ccgui/plugin-sdk";
+import { useChatStore } from "@/features/chat/store";
 import { AiChatSidebar } from "./ai-chat-sidebar";
 import type { AiChatRepo } from "./ai-chat-sidebar";
+
+// jsdom 没有 Tauri 宿主，真实 isWeb 为 true；默认沿用它，单个用例再切到桌面端。
+const platform = vi.hoisted(() => ({ isWeb: true }));
+vi.mock("@/lib/platform", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/lib/platform")>()),
+  get isWeb() {
+    return platform.isWeb;
+  },
+}));
 
 vi.mock("react-i18next", () => ({
   useTranslation: () => ({ t: (key: string) => key }),
@@ -23,6 +33,7 @@ let root: Root;
 
 beforeEach(() => {
   Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
+  useChatStore.setState({ workspaces: [] });
   localStorage.clear();
   node = document.createElement("div");
   document.body.append(node);
@@ -261,6 +272,21 @@ it("keeps hover actions to pin / rename / delete (archive is context-menu only)"
   expect(onThreadAction).toHaveBeenCalledWith("claude/hover-1", "archive");
 });
 
+it("hides agy editing but keeps Refresh rendering actionable", async () => {
+  const onThreadAction = vi.fn();
+  await act(async () => root.render(
+    <AiChatSidebar
+      repos={[{ id: "a", label: "a", defaultOpen: true, threads: [{ id: "agy/one", label: "agy session", time: "1m" }] }]}
+      onThreadAction={onThreadAction}
+    />,
+  ));
+  await rightClick(threadRow("agy session"));
+  const menu = openMenu();
+  expect(menu.textContent).not.toContain("chat.editSession");
+  await act(async () => menuItem(menu, "chat.refreshSessionRendering").click());
+  expect(onThreadAction).toHaveBeenCalledWith("agy/one", "refresh");
+});
+
 it("opens the thread context menu on right-click and dispatches its entries", async () => {
   const onThreadAction = vi.fn();
   const onCopyThreadId = vi.fn();
@@ -288,6 +314,11 @@ it("opens the thread context menu on right-click and dispatches its entries", as
 
   await rightClick(threadRow("整理发布脚本"));
   menu = openMenu();
+  await act(async () => menuItem(menu, "chat.copySessionPath").click());
+  expect(onThreadAction).toHaveBeenCalledWith("claude/abc-123", "copyPath");
+
+  await rightClick(threadRow("整理发布脚本"));
+  menu = openMenu();
   await act(async () => menuItem(menu, "chat.archiveSession").click());
   expect(onThreadAction).toHaveBeenCalledWith("claude/abc-123", "archive");
 
@@ -295,6 +326,25 @@ it("opens the thread context menu on right-click and dispatches its entries", as
   menu = openMenu();
   await act(async () => menuItem(menu, "chat.deleteSession").click());
   expect(onThreadAction).toHaveBeenCalledWith("claude/abc-123", "delete");
+});
+
+it("「打开文件路径」只在桌面端出现：web 访问会在宿主机上开文件管理器", async () => {
+  const onThreadAction = vi.fn();
+  const repos = [{ id: "a", label: "a", defaultOpen: true, threads: [{ id: "codex/s-1", label: "定位会话", time: "1m" }] }];
+  await act(async () => root.render(<AiChatSidebar repos={repos} onThreadAction={onThreadAction} />));
+  await rightClick(threadRow("定位会话"));
+  expect(openMenu().textContent).not.toContain("chat.revealSessionFile");
+  expect(openMenu().textContent).toContain("chat.copySessionPath");
+  await act(async () => document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape" })));
+
+  platform.isWeb = false;
+  try {
+    await rightClick(threadRow("定位会话"));
+    await act(async () => menuItem(openMenu(), "chat.revealSessionFile").click());
+    expect(onThreadAction).toHaveBeenCalledWith("codex/s-1", "reveal");
+  } finally {
+    platform.isWeb = true;
+  }
 });
 
 it("renders plugin session-menu items and dispatches the parsed target", async () => {
@@ -350,6 +400,40 @@ it("renders plugin workspace-menu items for the right-clicked workspace", async 
     // Disposal re-renders the still-mounted sidebar (useSyncExternalStore).
     await act(async () => dispose());
   }
+});
+
+it("只有置顶回调时仍可打开工作区右键菜单", async () => {
+  useChatStore.setState({ workspaces: [{ id: "a", path: "/ws/a", name: "a", lastOpenedAt: null, sortOrder: 0, groupId: null, pinned: false }] });
+  const onSetWorkspacePinned = vi.fn();
+  await act(async () => root.render(<AiChatSidebar repos={[repo("a")]} onSetWorkspacePinned={onSetWorkspacePinned} />));
+  await rightClick(rowFor("a"));
+  await act(async () => menuItem(openMenu(), "chat.pinWorkspace").click());
+  expect(onSetWorkspacePinned).toHaveBeenCalledWith("a", true);
+});
+
+it("分组内置顶与普通工作区分段排序且仅置顶行显示图钉", async () => {
+  await act(async () => root.render(
+    <AiChatSidebar
+      repos={[]}
+      sections={[{ id: "g", name: "分组", repos: [
+        { ...repo("p1"), pinned: true },
+        { ...repo("p2"), pinned: true },
+        repo("r1"),
+        repo("r2"),
+      ] }]}
+      onReorderWorkspaces={() => {}}
+    />,
+  ));
+  const lists = [...node.querySelectorAll<HTMLElement>('[data-workspace-reorder-list="true"]')];
+  expect(lists.map((list) => [...list.querySelectorAll<HTMLElement>("[data-workspace-id]")].map((row) => row.dataset.workspaceId))).toEqual([
+    ["p1", "p2"], ["r1", "r2"],
+  ]);
+  expect(rowFor("p1").querySelector(".lucide-pin")).not.toBeNull();
+  expect(rowFor("r1").querySelector(".lucide-pin")).toBeNull();
+  // The glyph is aria-hidden; the pinned state reaches screen readers as
+  // visually hidden text inside the row button.
+  expect(rowFor("p1").querySelector(".sr-only")?.textContent).toBe("chat.workspacePinned");
+  expect(rowFor("r1").querySelector(".sr-only")).toBeNull();
 });
 
 it("draft 新对话右键只提供删除,不暴露重命名/复制 ID/插件项", async () => {
@@ -708,6 +792,55 @@ it("收起的 worktree 子行聚合显示运行中状态点，展开后让位给
   expect(runRow.querySelector(".sidebar-thread-status")).toBeNull();
   const threadDot = threadRow("运行中会话").querySelector(".sidebar-thread-status");
   expect(threadDot?.classList.contains("sidebar-thread-status-processing")).toBe(true);
+});
+
+it("工作区头行透传名下所有会话的运行状态（worktree 子级也计入）", async () => {
+  // 会话行自己的点只在展开/可见时看得到；工作区行的聚合点让收起与展开
+  // 两种形态都能一眼看出这个项目还有东西在跑。
+  await render([
+    {
+      id: "ws-run",
+      label: "ws-run",
+      defaultOpen: true,
+      threads: [
+        { id: "t-run", label: "运行中会话", time: "", streaming: true },
+        { id: "t-done", label: "已完成会话", time: "" },
+      ],
+    },
+    {
+      id: "ws-wt",
+      label: "ws-wt",
+      threads: [],
+      worktrees: [
+        {
+          id: "ws-wt::child",
+          label: "child",
+          threads: [
+            { id: "t-child-retry", label: "退避会话", time: "", streaming: true, retrying: true },
+          ],
+          worktree: { branch: "child" },
+        },
+      ],
+    },
+    {
+      id: "ws-idle",
+      label: "ws-idle",
+      threads: [{ id: "t-idle", label: "空闲会话", time: "" }],
+    },
+  ]);
+
+  // 展开的工作区照样带聚合点，与会话行自己的点并存。
+  const runDot = rowFor("ws-run").querySelector(".sidebar-thread-status");
+  expect(runDot?.classList.contains("sidebar-thread-status-processing")).toBe(true);
+  expect(runDot?.classList.contains("sidebar-thread-status-retrying")).toBe(false);
+
+  // worktree 子工作区里的会话也算：全部退避重试时降为静态点。
+  const wtDot = rowFor("ws-wt").querySelector(".sidebar-thread-status");
+  expect(wtDot?.classList.contains("sidebar-thread-status-processing")).toBe(true);
+  expect(wtDot?.classList.contains("sidebar-thread-status-retrying")).toBe(true);
+
+  // 名下没有运行中会话的工作区不渲染点。
+  expect(rowFor("ws-idle").querySelector(".sidebar-thread-status")).toBeNull();
 });
 
 /** The innermost disclosure region holding the worktree child rows. */

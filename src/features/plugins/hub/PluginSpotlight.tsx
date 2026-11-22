@@ -8,8 +8,14 @@ import { IconButton } from "@/components/base/buttons/icon-button";
 import type { FeaturedPlugin, MarketPlugin } from "@/lib/ipc";
 import { cx } from "@/utils/cx";
 import { githubLoginFor, isOfficialPlugin, pluginAvatarGradient } from "./catalog";
+import { formatInstallCount } from "./install-count";
 import { PluginAvatar } from "./PluginAvatar";
 import { MarketActionButton } from "./MarketActionButton";
+import {
+  PluginTranslateMenu,
+  summarySourceFor,
+  useSummaryView,
+} from "./translation/PluginTranslateControl";
 import { useMarketplaceStore } from "../marketplace/store";
 
 /**
@@ -115,7 +121,10 @@ function Slide({
   const official = isOfficialPlugin(entry);
   // 官方插件的作者位是品牌账号：用徽标代替账号，与表格同一规则。
   const login = official ? null : githubLoginFor(entry);
-  const pitch = featured.tagline ?? entry.description;
+  // 精选卡的文案来自同一份摘要译文（含精选语与推荐语），与表格行一致。
+  const summary = summarySourceFor(entry, featured);
+  const view = useSummaryView(entry.id, summary);
+  const pitch = view.tagline ?? view.description;
 
   return (
     <article
@@ -147,11 +156,11 @@ function Slide({
           </span>
         </div>
 
-        <h3 className="truncate text-title-2-medium text-text-white">{entry.name}</h3>
+        <h3 className="truncate text-title-2-medium text-text-white">{view.name}</h3>
         {pitch && <p className="line-clamp-2 text-body-regular text-text-white/85">{pitch}</p>}
-        {featured.note && (
+        {view.note && (
           <p className="border-l-2 border-white/30 pl-2.5 text-body-2-regular text-text-white/70 max-lg:hidden">
-            {featured.note}
+            {view.note}
           </p>
         )}
 
@@ -164,7 +173,7 @@ function Slide({
             <>
               <span aria-hidden className="size-0.5 shrink-0 rounded-full bg-white/50" />
               <span className="shrink-0 tabular-nums">
-                {t("plugins.hub.downloadsShort", { n: entry.downloads })}
+                {t("plugins.hub.downloadsShort", { n: formatInstallCount(entry.downloads) })}
               </span>
             </>
           )}
@@ -182,6 +191,14 @@ function Slide({
           >
             {t("plugins.hub.spotlightDetail")}
           </Button>
+          <PluginTranslateMenu
+            pluginId={entry.id}
+            summary={summary}
+            fetchReadme
+            variant="icon"
+            size="medium"
+            excludeFromTabOrder={!active}
+          />
         </div>
       </div>
     </article>

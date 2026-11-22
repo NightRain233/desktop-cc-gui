@@ -2,7 +2,9 @@ use super::discovery::{
     codebuddy_transcripts, codex_candidates, discover_agy, discover_claude, discover_codebuddy_in,
     discover_grok, discover_kimi, discover_minimax, discover_opencode, discover_qoder,
     dsh_candidates, identify_head, is_codex_subagent_file, is_dsh_subagent_file,
-    opencode_db_visible_sessions, path_is_under, pi_family_candidates,
+    qoder_transcript_conflicts_with_workspace,
+    opencode_db_updated_times, opencode_db_visible_sessions, opencode_tree_file_superseded,
+    opencode_tree_root, path_is_under, pi_family_candidates,
 };
 use super::{same_or_child, scan_summary_file, split_opencode_db_path, stat_signature, ScanSummary};
 use serde::Serialize;
@@ -216,6 +218,7 @@ struct IndexedFile {
     mtime_ms: i64,
     engine: String,
     session_id: String,
+    workspace_path: String,
     accepted_signature: String,
 }
 
@@ -229,7 +232,7 @@ fn prefetch_stat_keys(
     let mut stmt = conn
         .prepare(
             "SELECT file_path, file_size, file_mtime_ms, engine, session_id,
-                    accepted_frames_signature
+                    workspace_path, accepted_frames_signature
              FROM sessions",
         )
         .map_err(|e| e.to_string())?;
@@ -242,7 +245,8 @@ fn prefetch_stat_keys(
                     mtime_ms: r.get(2)?,
                     engine: r.get(3)?,
                     session_id: r.get(4)?,
-                    accepted_signature: r.get(5)?,
+                    workspace_path: r.get(5)?,
+                    accepted_signature: r.get(6)?,
                 },
             ))
         })
@@ -299,6 +303,10 @@ fn prepare_candidate(
             .map_or("", |set| set.signature.as_str());
         if (indexed.size, indexed.mtime_ms) == sig
             && indexed.accepted_signature == current
+            && cand
+                .known_workspace
+                .as_ref()
+                .is_none_or(|workspace| workspace == &indexed.workspace_path)
             && !stale_paths.contains(&path_str)
         {
             return None;
@@ -468,10 +476,32 @@ fn prune_opencode_hidden_sessions(db: &crate::db::Db) -> Result<bool, String> {
             .map_err(|e| e.to_string())?;
         let mut grouped: std::collections::HashMap<PathBuf, Vec<String>> =
             std::collections::HashMap::new();
+        let mut trees: std::collections::HashMap<PathBuf, Vec<(String, PathBuf)>> =
+            std::collections::HashMap::new();
         for row in rows.flatten() {
             let (session_id, path) = row;
-            if let Some((db_path, _)) = split_opencode_db_path(Path::new(&path)) {
+            let path = PathBuf::from(path);
+            if let Some((db_path, _)) = split_opencode_db_path(&path) {
                 grouped.entry(db_path).or_default().push(session_id);
+            } else if let Some(root) = opencode_tree_root(&path).map(Path::to_path_buf) {
+                trees.entry(root).or_default().push((session_id, path));
+            }
+        }
+        drop(stmt);
+        drop(conn);
+        // A tree row indexed before its session moved into opencode.db is
+        // judged by the database row, as discovery now resolves it: a visible
+        // one is re-pointed by the upsert, a hidden one (archived) is dropped.
+        for (root, rows) in trees {
+            let in_database = opencode_db_updated_times(&root);
+            if in_database.is_empty() {
+                continue;
+            }
+            let db_path = root.join("opencode.db");
+            for (session_id, file) in rows {
+                if opencode_tree_file_superseded(&in_database, &session_id, &file) {
+                    grouped.entry(db_path.clone()).or_default().push(session_id);
+                }
             }
         }
         grouped
@@ -612,14 +642,22 @@ fn prune_missing_file_sessions(
     let live: HashSet<PathBuf> = candidates.iter().map(|c| c.path.clone()).collect();
     // Short lock for the row read; all file probing happens outside the lock
     // so metadata I/O cannot stretch the write-side critical section.
-    let rows: Vec<(String, String, String)> = {
+    let rows: Vec<(String, String, String, String)> = {
         let conn = db.0.lock();
         let mut stmt = conn
-            .prepare("SELECT engine, session_id, file_path FROM sessions WHERE file_path <> ''")
+            .prepare(
+                "SELECT engine, session_id, file_path, workspace_path
+                 FROM sessions WHERE file_path <> ''",
+            )
             .map_err(|e| e.to_string())?;
         let rows = stmt
             .query_map([], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                ))
             })
             .map_err(|e| e.to_string())?;
         let mut out = Vec::new();
@@ -633,12 +671,22 @@ fn prune_missing_file_sessions(
     };
     let mut attached: HashMap<PathBuf, bool> = HashMap::new();
     let mut dead: Vec<(String, String)> = Vec::new();
-    for (engine, session_id, file_path) in rows {
+    for (engine, session_id, file_path, workspace_path) in rows {
         let path = PathBuf::from(&file_path);
         if live.contains(&path)
             || is_remote_path(&file_path)
             || super::split_opencode_db_path(&path).is_some()
         {
+            continue;
+        }
+        // A previous Qoder discovery build could persist a colliding bucket's
+        // file under the wrong workspace. The file still exists, so missing-
+        // file GC alone would never repair it. Delete only positive conflicts;
+        // unreadable/unknown cwd must not destroy an indexed custom title.
+        if matches!(engine.as_str(), "qoder" | "qoder-cn")
+            && qoder_transcript_conflicts_with_workspace(&path, Path::new(&workspace_path))
+        {
+            dead.push((engine, session_id));
             continue;
         }
         if definitely_missing(&path, &mut attached) {
@@ -872,9 +920,27 @@ pub(super) mod tests {
     /// Point HOME at a scratch dir for the duration of a test.
     /// Serialized: two tests mutating HOME in parallel would clobber each other.
     pub(crate) use crate::paths::HOME_ENV_LOCK as HOME_LOCK;
+
+    /// 引擎自己的 home 变量：`engine_home()` / `codex_home()` **优先**读它们，
+    /// 读不到才回落到 HOME / USERPROFILE。
+    ///
+    /// 测试要的是"整个引擎都指向临时 home"，只改 HOME 做不到：机器上设过
+    /// `DSH_HOME` / `CODEX_HOME` 这类变量时，扫描会落到 scratch 之外的目录，看不到
+    /// 测试布置的会话文件，于是同一套测试随环境变红、且只红在设过变量的机器上。
+    /// 所以这些变量在 `set` 时一并摘掉、`drop` 时按原样恢复。
+    const ENGINE_HOME_KEYS: [&str; 6] = [
+        "CLAUDE_CONFIG_DIR",
+        "CODEX_HOME",
+        "KIMI_HOME",
+        "DSH_HOME",
+        "MINIMAX_DATA_DIR",
+        "OPENCODE_HOME",
+    ];
+
     pub struct HomeGuard {
         _lock: parking_lot::MutexGuard<'static, ()>,
         prev: HomeEnvPair,
+        engine_homes: Vec<(&'static str, Option<std::ffi::OsString>)>,
     }
     impl HomeGuard {
         pub fn set(home: &Path) -> Self {
@@ -887,9 +953,19 @@ pub(super) mod tests {
             // typical Windows case).
             let prev_profile = std::env::var_os("USERPROFILE");
             std::env::set_var("USERPROFILE", home);
+            // 摘掉引擎级变量：它们排在 HOME / USERPROFILE 之前生效。
+            let engine_homes = ENGINE_HOME_KEYS
+                .into_iter()
+                .map(|key| {
+                    let previous = std::env::var_os(key);
+                    std::env::remove_var(key);
+                    (key, previous)
+                })
+                .collect();
             Self {
                 _lock: lock,
                 prev: HomeEnvPair(prev, prev_profile),
+                engine_homes,
             }
         }
     }
@@ -906,6 +982,13 @@ pub(super) mod tests {
             match profile {
                 Some(value) => std::env::set_var("USERPROFILE", value),
                 None => std::env::remove_var("USERPROFILE"),
+            }
+            // 引擎级变量按原样恢复：原本没设的保持"没设"。
+            for (key, value) in &self.engine_homes {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
             }
         }
     }
@@ -1798,6 +1881,93 @@ pub(super) mod tests {
         Ok(())
     }
 
+    /// Rows indexed from the JSON tree before OpenCode 1.2+ migrated it into
+    /// opencode.db follow the database copy: a visible one is re-pointed to
+    /// its database row, one the database hides (archived) leaves the sidebar
+    /// instead of lingering on the frozen file, and a tree newer than the
+    /// database (a 1.1 binary still in use) keeps its tree row.
+    #[test]
+    fn scan_resolves_tree_rows_superseded_by_the_database() -> Result<(), String> {
+        let home = scratch_dir("scan-opencode-migrated");
+        let workspace = home.join("ws");
+        std::fs::create_dir_all(&workspace).map_err(|e| e.to_string())?;
+        let ws = workspace.to_string_lossy().to_string();
+        // Build every component with `join`, exactly as `opencode_data_roots`
+        // does: the row stores discovery's path text verbatim, so a literal
+        // `.local/share/opencode` would differ on Windows (`\` vs `/`) even
+        // though it names the same directory.
+        let data_root = home.join(".local").join("share").join("opencode");
+        let project = data_root.join("storage").join("session").join("b8119e41");
+        std::fs::create_dir_all(&project).map_err(|e| e.to_string())?;
+        for (id, updated) in [("ses_live", 2), ("ses_archived", 1), ("ses_downgraded", 50)] {
+            std::fs::write(
+                project.join(format!("{id}.json")),
+                serde_json::json!({"id": id, "projectID": "b8119e41", "directory": ws, "time": {"updated": updated}})
+                    .to_string(),
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        let opencode_db = data_root.join("opencode.db");
+        {
+            let conn = rusqlite::Connection::open(&opencode_db).map_err(|e| e.to_string())?;
+            conn.execute_batch(
+                "CREATE TABLE session(id TEXT PRIMARY KEY, directory TEXT NOT NULL,
+                    parent_id TEXT, time_archived INTEGER, time_updated INTEGER NOT NULL);
+                 CREATE TABLE message(id TEXT PRIMARY KEY, session_id TEXT NOT NULL);",
+            )
+            .map_err(|e| e.to_string())?;
+            for (id, archived, updated) in [("ses_live", None, 2), ("ses_archived", Some(9), 5), ("ses_downgraded", None, 10)] {
+                conn.execute(
+                    "INSERT INTO session VALUES(?1,?2,NULL,?3,?4)",
+                    rusqlite::params![id, ws, archived, updated],
+                )
+                .map_err(|e| e.to_string())?;
+                conn.execute("INSERT INTO message VALUES(?1,?1)", [id])
+                    .map_err(|e| e.to_string())?;
+            }
+        }
+        let _guard = HomeGuard::set(&home);
+        let db = crate::db::Db::open_at(&home.join("app.db")).map_err(|e| e.to_string())?;
+        {
+            let conn = db.0.lock();
+            conn.execute(
+                "INSERT INTO workspaces(id, path, name) VALUES('w1', ?1, 'ws')",
+                [&ws],
+            )
+            .map_err(|e| e.to_string())?;
+            for id in ["ses_live", "ses_archived", "ses_downgraded"] {
+                conn.execute(
+                    "INSERT INTO sessions(engine, session_id, workspace_path, file_path, file_size, file_mtime_ms, title) VALUES('opencode', ?1, ?2, ?3, 1, 1, '')",
+                    rusqlite::params![id, ws, project.join(format!("{id}.json")).to_string_lossy().to_string()],
+                )
+                .map_err(|e| e.to_string())?;
+            }
+        }
+        scan_with(&db, || {})?;
+        let rows: Vec<(String, String)> = {
+            let conn = db.0.lock();
+            let mut stmt = conn
+                .prepare("SELECT session_id, file_path FROM sessions WHERE engine='opencode' ORDER BY session_id")
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+                .map_err(|e| e.to_string())?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?
+        };
+        let live = super::super::opencode_db_session_path(&opencode_db, "ses_live");
+        assert_eq!(
+            rows,
+            vec![
+                ("ses_downgraded".to_string(), project.join("ses_downgraded.json").to_string_lossy().to_string()),
+                ("ses_live".to_string(), live.to_string_lossy().to_string()),
+            ]
+        );
+        drop(db);
+        std::fs::remove_dir_all(&home).ok();
+        Ok(())
+    }
+
     #[test]
     fn default_codex_home_keeps_indexed_sessions() -> Result<(), String> {
         let home = scratch_dir("scan-codex-default-keep");
@@ -2193,6 +2363,268 @@ pub(super) mod tests {
                 assert!(!storage_attached(&sessions, &mut verdicts));
             }
         }
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    fn write_qoder_session(bucket: &Path, session_id: &str, cwd: &Path) {
+        std::fs::create_dir_all(bucket).unwrap();
+        std::fs::write(
+            bucket.join(format!("{session_id}.jsonl")),
+            format!("{}\n", qoder_user_line(session_id, cwd, "第一轮")),
+        )
+        .unwrap();
+    }
+
+    fn qoder_user_line(session_id: &str, cwd: &Path, text: &str) -> serde_json::Value {
+        serde_json::json!({
+            "type": "user",
+            "sessionId": session_id,
+            "cwd": cwd.to_string_lossy(),
+            "uuid": format!("{session_id}-{text}"),
+            "timestamp": "2026-11-01T00:00:00.000Z",
+            "message": { "role": "user", "content": text },
+        })
+    }
+
+    fn register_workspace(db: &crate::db::Db, id: &str, path: &Path) {
+        db.0.lock()
+            .execute(
+                "INSERT INTO workspaces(id, path, name) VALUES(?1, ?2, ?1)",
+                rusqlite::params![id, path.to_string_lossy()],
+            )
+            .unwrap();
+    }
+
+    fn qoder_session_workspace(db: &crate::db::Db, session_id: &str) -> Option<String> {
+        db.0.lock()
+            .query_row(
+                "SELECT workspace_path FROM sessions WHERE engine='qoder' AND session_id=?1",
+                [session_id],
+                |row| row.get(0),
+            )
+            .ok()
+    }
+
+    fn seed_qoder_row(
+        db: &crate::db::Db,
+        session_id: &str,
+        workspace: &Path,
+        transcript: &Path,
+        custom_title: &str,
+    ) {
+        let (size, mtime_ms) = stat_signature(transcript).unwrap();
+        db.0.lock()
+            .execute(
+                "INSERT INTO sessions(
+                    engine, session_id, workspace_path, file_path, file_size,
+                    file_mtime_ms, custom_title
+                 ) VALUES('qoder', ?1, ?2, ?3, ?4, ?5, ?6)",
+                rusqlite::params![
+                    session_id,
+                    workspace.to_string_lossy(),
+                    transcript.to_string_lossy(),
+                    size,
+                    mtime_ms,
+                    custom_title,
+                ],
+            )
+            .unwrap();
+    }
+
+    /// 「前端」「后端」编码后是同一个目录，会话必须按转录本里的 cwd 归属。
+    #[test]
+    fn qoder_colliding_workspaces_keep_their_own_sessions() {
+        let home = scratch_dir("qoder-collision-both");
+        let _guard = HomeGuard::set(&home);
+        let frontend = home.join("项目").join("前端");
+        let backend = home.join("项目").join("后端");
+        std::fs::create_dir_all(&frontend).unwrap();
+        std::fs::create_dir_all(&backend).unwrap();
+        let slug = super::super::claude_encode_project_path(&frontend.to_string_lossy());
+        assert_eq!(
+            slug,
+            super::super::claude_encode_project_path(&backend.to_string_lossy())
+        );
+        let bucket = home.join(".qoder").join("projects").join(&slug);
+        write_qoder_session(&bucket, "frontend-session", &frontend);
+        write_qoder_session(&bucket, "backend-session", &backend);
+        let db = crate::db::Db::open_at(&home.join("app.db")).unwrap();
+        register_workspace(&db, "w1", &frontend);
+        register_workspace(&db, "w2", &backend);
+
+        scan_with(&db, || {}).unwrap();
+
+        assert_eq!(
+            qoder_session_workspace(&db, "frontend-session").as_deref(),
+            Some(&*frontend.to_string_lossy())
+        );
+        assert_eq!(
+            qoder_session_workspace(&db, "backend-session").as_deref(),
+            Some(&*backend.to_string_lossy())
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// 没有加入 CC GUI 的「后端」只在终端里用过，它的会话不能出现在「前端」名下。
+    #[test]
+    fn qoder_unregistered_neighbor_stays_out_of_workspace() {
+        let home = scratch_dir("qoder-collision-neighbor");
+        let _guard = HomeGuard::set(&home);
+        let frontend = home.join("项目").join("前端");
+        let backend = home.join("项目").join("后端");
+        std::fs::create_dir_all(&frontend).unwrap();
+        let slug = super::super::claude_encode_project_path(&frontend.to_string_lossy());
+        let bucket = home.join(".qoder").join("projects").join(&slug);
+        write_qoder_session(&bucket, "backend-session", &backend);
+        let db = crate::db::Db::open_at(&home.join("app.db")).unwrap();
+        register_workspace(&db, "w1", &frontend);
+
+        scan_with(&db, || {}).unwrap();
+
+        assert_eq!(qoder_session_workspace(&db, "backend-session"), None);
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// 回归：`my-app` 的会话在基线上一直归属正确，加入 `my app` 后再聊一轮也不能跳走。
+    #[test]
+    fn qoder_new_turn_stays_in_its_workspace_after_colliding_add() {
+        let home = scratch_dir("qoder-collision-turn");
+        let _guard = HomeGuard::set(&home);
+        let dashed = home.join("my-app");
+        let spaced = home.join("my app");
+        std::fs::create_dir_all(&dashed).unwrap();
+        std::fs::create_dir_all(&spaced).unwrap();
+        let slug = super::super::claude_encode_project_path(&dashed.to_string_lossy());
+        let bucket = home.join(".qoder").join("projects").join(&slug);
+        write_qoder_session(&bucket, "dashed-session", &dashed);
+        let db = crate::db::Db::open_at(&home.join("app.db")).unwrap();
+        register_workspace(&db, "w1", &dashed);
+        scan_with(&db, || {}).unwrap();
+
+        register_workspace(&db, "w2", &spaced);
+        let transcript = bucket.join("dashed-session.jsonl");
+        let mut text = std::fs::read_to_string(&transcript).unwrap();
+        text.push_str(&format!(
+            "{}\n",
+            qoder_user_line("dashed-session", &dashed, "第二轮")
+        ));
+        std::fs::write(&transcript, text).unwrap();
+        scan_with(&db, || {}).unwrap();
+
+        assert_eq!(
+            qoder_session_workspace(&db, "dashed-session").as_deref(),
+            Some(&*dashed.to_string_lossy())
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// 有损 CLI 目录里的无 cwd 文件不能靠目录名猜归某一个碰撞工作区。
+    #[test]
+    fn qoder_unknown_cwd_is_not_guessed_from_cli_bucket() {
+        let home = scratch_dir("qoder-collision-unknown-cwd");
+        let _guard = HomeGuard::set(&home);
+        let frontend = home.join("项目").join("前端");
+        let backend = home.join("项目").join("后端");
+        std::fs::create_dir_all(&frontend).unwrap();
+        std::fs::create_dir_all(&backend).unwrap();
+        let slug = super::super::claude_encode_project_path(&frontend.to_string_lossy());
+        let bucket = home.join(".qoder").join("projects").join(&slug);
+        std::fs::create_dir_all(&bucket).unwrap();
+        std::fs::write(bucket.join("unknown.jsonl"), "{}\n").unwrap();
+        let db = crate::db::Db::open_at(&home.join("app.db")).unwrap();
+        register_workspace(&db, "w1", &frontend);
+        register_workspace(&db, "w2", &backend);
+
+        scan_with(&db, || {}).unwrap();
+
+        assert_eq!(qoder_session_workspace(&db, "unknown"), None);
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// 旧构建已经写错工作区时，即使文件签名不变也必须重写归属并保留标题。
+    #[test]
+    fn qoder_unchanged_file_repairs_previous_workspace_attribution() {
+        let home = scratch_dir("qoder-repair-unchanged");
+        let _guard = HomeGuard::set(&home);
+        let frontend = home.join("项目").join("前端");
+        let backend = home.join("项目").join("后端");
+        std::fs::create_dir_all(&frontend).unwrap();
+        std::fs::create_dir_all(&backend).unwrap();
+        let slug = super::super::claude_encode_project_path(&frontend.to_string_lossy());
+        let bucket = home.join(".qoder").join("projects").join(&slug);
+        write_qoder_session(&bucket, "frontend-session", &frontend);
+        let transcript = bucket.join("frontend-session.jsonl");
+        let db = crate::db::Db::open_at(&home.join("app.db")).unwrap();
+        register_workspace(&db, "w1", &frontend);
+        register_workspace(&db, "w2", &backend);
+        seed_qoder_row(&db, "frontend-session", &backend, &transcript, "保留标题");
+
+        scan_with(&db, || {}).unwrap();
+
+        assert_eq!(
+            qoder_session_workspace(&db, "frontend-session").as_deref(),
+            Some(&*frontend.to_string_lossy())
+        );
+        let title: String = db
+            .0
+            .lock()
+            .query_row(
+                "SELECT custom_title FROM sessions WHERE engine='qoder' AND session_id='frontend-session'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(title, "保留标题");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// 实际工作区未注册时，已确认归属别处的旧行也不能继续挂在错误工作区。
+    #[test]
+    fn qoder_confirmed_old_misattribution_is_pruned() {
+        let home = scratch_dir("qoder-prune-misattributed");
+        let _guard = HomeGuard::set(&home);
+        let frontend = home.join("项目").join("前端");
+        let backend = home.join("项目").join("后端");
+        std::fs::create_dir_all(&frontend).unwrap();
+        let slug = super::super::claude_encode_project_path(&frontend.to_string_lossy());
+        let bucket = home.join(".qoder").join("projects").join(&slug);
+        write_qoder_session(&bucket, "backend-session", &backend);
+        let transcript = bucket.join("backend-session.jsonl");
+        let db = crate::db::Db::open_at(&home.join("app.db")).unwrap();
+        register_workspace(&db, "w1", &frontend);
+        seed_qoder_row(&db, "backend-session", &frontend, &transcript, "旧标题");
+
+        scan_with(&db, || {}).unwrap();
+
+        assert_eq!(qoder_session_workspace(&db, "backend-session"), None);
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// 工作区符号链接的目标暂时脱盘时，路径别名差异不能触发破坏性清理。
+    #[cfg(unix)]
+    #[test]
+    fn qoder_detached_workspace_alias_keeps_indexed_metadata() {
+        let home = scratch_dir("qoder-detached-alias");
+        let _guard = HomeGuard::set(&home);
+        let target = home.join("detached-target");
+        let workspace = home.join("workspace-link");
+        std::fs::create_dir_all(&target).unwrap();
+        std::os::unix::fs::symlink(&target, &workspace).unwrap();
+        let slug = super::super::claude_encode_project_path(&target.to_string_lossy());
+        let bucket = home.join(".qoder").join("projects").join(&slug);
+        write_qoder_session(&bucket, "detached-session", &target);
+        let transcript = bucket.join("detached-session.jsonl");
+        let db = crate::db::Db::open_at(&home.join("app.db")).unwrap();
+        register_workspace(&db, "w1", &workspace);
+        seed_qoder_row(&db, "detached-session", &workspace, &transcript, "保留标题");
+        std::fs::remove_dir_all(&target).unwrap();
+
+        scan_with(&db, || {}).unwrap();
+
+        assert_eq!(
+            qoder_session_workspace(&db, "detached-session").as_deref(),
+            Some(&*workspace.to_string_lossy())
+        );
         std::fs::remove_dir_all(&home).ok();
     }
 }
